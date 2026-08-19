@@ -1,4 +1,6 @@
-anqi_sample
-.DS_Store
+bin/dataset_gt
+bin/rknn_query
+sample/run/
+sample/data/
 *.o
 *.d

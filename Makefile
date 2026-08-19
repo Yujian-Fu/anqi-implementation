@@ -1,18 +1,23 @@
-CXX ?= c++
-CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -pedantic
+CXX ?= g++
+CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -mavx512f -march=native -fopenmp -Iinclude
+LDFLAGS ?= -lboost_filesystem -lboost_system
 
-TARGET := anqi_sample
-SOURCES := src/anqi_sample.cpp
+BIN_DIR := bin
+HEADERS := $(wildcard include/*.h)
+TARGETS := $(BIN_DIR)/dataset_gt $(BIN_DIR)/rknn_query
 
-.PHONY: all clean sample
+.PHONY: all clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SOURCES)
-	$(CXX) $(CXXFLAGS) $(SOURCES) -o $@
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
 
-sample: $(TARGET)
-	./$(TARGET)
+$(BIN_DIR)/dataset_gt: tools/dataset_gt.cpp $(HEADERS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) tools/dataset_gt.cpp -o $@ $(LDFLAGS)
+
+$(BIN_DIR)/rknn_query: src/rknn_query.cpp $(HEADERS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) src/rknn_query.cpp -o $@ $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
