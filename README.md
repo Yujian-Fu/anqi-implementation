@@ -72,6 +72,19 @@ make -j
 ./scripts/prepare_sift1m.sh
 ```
 
+The default data location is:
+
+```text
+data/sift1m/sift.tar.gz      downloaded archive
+data/sift1m/raw/             extracted fvecs files
+data/sift1m/SIFT1M_*        converted ANQI files and generated artifacts
+```
+
+For a manual download, place `sift.tar.gz` at
+`data/sift1m/sift.tar.gz`. The preparation script uses this archive, extracts
+the source vectors into `data/sift1m/raw/`, and writes the converted dataset
+prefix as `data/sift1m/SIFT1M`.
+
 This creates the following reproducible prefix and keeps all generated files
 under `data/sift1m/`:
 
