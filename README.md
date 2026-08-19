@@ -55,6 +55,61 @@ quick correctness smoke test.
 The sample uses four OpenMP threads for speed. Production measurements must
 use 64 threads and the warmed timing protocol.
 
+## Reproduce with SIFT1M
+
+Use the canonical ANN SIFT1M release from the INRIA TEXMEX corpus:
+
+```text
+https://corpus-texmex.irisa.fr/
+ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+```
+
+The archive contains `sift_base.fvecs` (1,000,000 x 128),
+`sift_query.fvecs` (10,000 x 128), `sift_learn.fvecs`, and the original ANN
+ground-truth file. ANQI does not use the supplied query ground truth for its
+RkNN metric: it generates exact base-to-base top-100 radii and exact query
+membership itself.
+
+From the repository root, run:
+
+```bash
+make -j
+./scripts/prepare_sift1m.sh
+```
+
+This creates the following reproducible prefix and keeps all generated files
+under `data/sift1m/`:
+
+```text
+data/sift1m/raw/sift_*.fvecs       downloaded source files
+data/sift1m/SIFT1M_base.bin       float32 fbin, [uint32 n][uint32 d][values]
+data/sift1m/SIFT1M_query.bin      float32 fbin, same dimension
+data/sift1m/SIFT1M_baseknn_gt.bin exact base-to-base top-100 table
+data/sift1m/SIFT1M_rknn_gt_k10.bin
+data/sift1m/SIFT1M_rknn_gt_k50.bin exact RkNN CSR tables
+data/sift1m/SIFT1M_rknn_gt_k100.bin
+data/sift1m/SIFT1M_rknn_gt.bin.rk  exact r_100 source
+data/sift1m/SIFT1M_radbasis_M8.bin
+data/sift1m/SIFT1M_learned_rq_codebook_M8_u8.bin
+```
+
+The preparation step is intentionally exact and can be resource-intensive:
+base-to-base top-100 construction scans the full 1M base set. Do not replace
+`SIFT1M_baseknn_gt.bin` with an approximate KNN table when reproducing the
+paper protocol.
+
+After preparation, run the same shared graph for each query k:
+
+```bash
+./scripts/run_final.sh "$PWD/data/sift1m/SIFT1M" 10
+./scripts/run_final.sh "$PWD/data/sift1m/SIFT1M" 50
+./scripts/run_final.sh "$PWD/data/sift1m/SIFT1M" 100
+```
+
+The commands print the construction summary and the measured
+recall/precision/QPS/distance results. By default they use 64 OpenMP threads,
+G48, exact-r100 Any-K Lift, and the M8+u8 LRQ-floor postfilter.
+
 ## Running a prepared benchmark prefix
 
 The prefix must contain:
