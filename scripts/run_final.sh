@@ -28,7 +28,7 @@ done
 RUN_ROOT="${ANQI_RUN_ROOT:-${PFX}_anqi_run_k${KQ}}"
 mkdir -p "${RUN_ROOT}/graph" "${RUN_ROOT}/verifier"
 
-# Clear legacy experiment switches, then pin the final paper configuration.
+# Set the final paper configuration for every run.
 unset ANQI_GRAPH_GEOMETRY ANQI_GRAPH_RANKM ANQI_RADIUS_MODE \
   ANQI_VERIFIER_PLACEMENT ANQI_RANKM ANQI_NK ANQI_GRAPH_NK \
   ANQI_RANKM_SLACK ANQI_RECHECK ANQI_VAMANA ANQI_EDGE_POLICY \

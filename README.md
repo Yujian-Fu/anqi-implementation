@@ -5,10 +5,8 @@ final ANQI reverse-kNN experiments. The sample is small only in its data size;
 it executes the same C++ exact-GT generator, Any-K Lift graph builder/searcher,
 and independent Rank-M/LRQ verifier as the full benchmark.
 
-The repository deliberately exposes one supported configuration. The
-user-facing runner does not select the earlier RNG/Vamana/bubble, rank-M graph
-geometry, exact-recheck, or toy paths; those are not part of the reproducible
-final command below.
+The repository provides one reproducible configuration through the commands
+below.
 
 ## Final path
 
@@ -23,8 +21,7 @@ The supported path is:
 - query `k` selected from `{10, 50, 100}` while reusing the same graph;
 - 64-thread warmed batch-wall timing for production runs.
 
-The final runner pins these values itself. Do not override them with legacy
-environment variables.
+The final runner sets these values automatically for every run.
 
 ## Platform requirements
 
@@ -66,9 +63,8 @@ ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 
 The archive contains `sift_base.fvecs` (1,000,000 x 128),
 `sift_query.fvecs` (10,000 x 128), `sift_learn.fvecs`, and the original ANN
-ground-truth file. ANQI does not use the supplied query ground truth for its
-RkNN metric: it generates exact base-to-base top-100 radii and exact query
-membership itself.
+ground-truth file. The preparation step generates the exact base-to-base
+top-100 radii and exact query membership used by the ANQI RkNN metric.
 
 From the repository root, run:
 
@@ -94,9 +90,8 @@ data/sift1m/SIFT1M_learned_rq_codebook_M8_u8.bin
 ```
 
 The preparation step is intentionally exact and can be resource-intensive:
-base-to-base top-100 construction scans the full 1M base set. Do not replace
-`SIFT1M_baseknn_gt.bin` with an approximate KNN table when reproducing the
-paper protocol.
+base-to-base top-100 construction scans the full 1M base set. The paper
+protocol uses the generated `SIFT1M_baseknn_gt.bin` as its exact source table.
 
 After preparation, run the same shared graph for each query k:
 
