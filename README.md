@@ -1,4 +1,4 @@
-# ANQI: Full Reproducible Implementation
+# ANQI Implementation
 
 This repository contains the complete production implementation used for the
 final ANQI reverse-kNN experiments. The sample is small only in its data size;
