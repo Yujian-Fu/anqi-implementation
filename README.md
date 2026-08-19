@@ -14,10 +14,10 @@ The supported path is:
 
 - exact base-to-base top-100 source with self exclusion;
 - one shared Any-K Lift graph using the exact `r_100` horizon;
-- graph degree `G48`, with Rank-M excluded from graph geometry;
+- graph geometry from Any-K Lift at degree `G48`;
 - independent verifier: Rank-M `M=8` + learned packed `u8` residual LRQ;
 - floor decoding and radius-reconstruction objective;
-- `slack=0` and no exact recheck;
+- radius slack `0`;
 - query `k` selected from `{10, 50, 100}` while reusing the same graph;
 - 64-thread warmed batch-wall timing for production runs.
 
@@ -26,9 +26,8 @@ The final runner sets these values automatically for every run.
 ## Platform requirements
 
 The production kernels use AVX-512, OpenMP, Boost filesystem/system, C++17,
-and Linux-style resource behavior. Use a Linux machine with AVX-512 support
-for the sample and benchmark. The sample is not intended to run on an
-AVX2-only laptop or macOS without adapting the compiler and dependencies.
+and Linux-style resource behavior. Run the sample and benchmark on a Linux
+machine with AVX-512 support.
 
 Install a C++17 compiler, OpenMP, Boost filesystem/system, Python 3, and NumPy.
 Then build:
@@ -168,8 +167,7 @@ products so that the same ascending comparison is used.
 
 ## Reproducibility notes
 
-The sample and benchmark binaries are the real production code, not a second
-implementation. Large datasets and generated indexes are intentionally not
-committed. Keep them in an isolated run directory and record compiler,
-OpenMP thread count, machine, input checksums, and the printed construction
-and warmed-search summaries alongside the results.
+The sample and benchmark invoke the production C++ binaries. Keep datasets
+and generated indexes in an isolated run directory, and record the compiler,
+OpenMP thread count, machine, input checksums, construction summary, and
+warmed-search summary alongside the results.
