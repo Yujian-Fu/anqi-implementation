@@ -23,6 +23,13 @@ The supported path is:
 
 The final runner sets these values automatically for every run.
 
+## Technical report
+
+The full technical report, including the mathematical derivations and extended
+appendix material omitted from the submission version, is available here:
+
+- [ANQI technical report](technical_report.pdf)
+
 ## Platform requirements
 
 The production kernels use AVX-512, OpenMP, Boost filesystem/system, C++17,
