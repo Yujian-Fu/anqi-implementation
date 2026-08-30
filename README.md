@@ -1,14 +1,13 @@
 # ANQI Implementation
 
-This repository contains the complete production implementation used for the
-final ANQI reverse-kNN experiments. The sample is small only in its data size;
-it executes the same C++ exact-GT generator, Any-K Lift graph builder/searcher,
-and independent Rank-M/LRQ verifier as the full benchmark.
+This repository contains the ANQI reverse-kNN implementation used for the
+paper experiments. The sample runs the same C++ ground-truth generator, Any-K
+Lift graph builder and searcher, and Rank-M/LRQ verifier as the full benchmark.
 
 The repository provides one reproducible configuration through the commands
 below.
 
-## Final path
+## Pinned benchmark configuration
 
 The supported path is:
 
@@ -19,9 +18,9 @@ The supported path is:
 - floor decoding and radius-reconstruction objective;
 - radius slack `0`;
 - query `k` selected from `{10, 50, 100}` while reusing the same graph;
-- 64-thread warmed batch-wall timing for production runs.
+- 64-thread warmed batch timing for reported runs.
 
-The final runner sets these values automatically for every run.
+The benchmark wrapper sets these values for every run.
 
 ## Technical report
 
@@ -32,12 +31,10 @@ appendix material omitted from the submission version, is available here:
 
 ## Platform requirements
 
-The production kernels use AVX-512, OpenMP, Boost filesystem/system, C++17,
-and Linux-style resource behavior. Run the sample and benchmark on a Linux
-machine with AVX-512 support.
+The implementation uses AVX-512, OpenMP, C++17, and Linux system interfaces.
+Run the sample and benchmark on a Linux machine with AVX-512 support.
 
-Install a C++17 compiler, OpenMP, Boost filesystem/system, Python 3, and NumPy.
-Then build:
+Install a C++17 compiler, OpenMP, Python 3, and NumPy. Then build:
 
 ```bash
 make -j
@@ -47,15 +44,15 @@ make -j
 
 The sample creates a deterministic 256-vector base and 32 queries, generates
 exact top-100 and exact reverse-kNN ground truth for `k=10,50,100`, trains the
-final M8/u8 LRQ artifacts, builds the shared G48 Any-K Lift graph, and runs the
-real production query executable. It is intentionally small enough for a
-quick correctness smoke test.
+M8/u8 LRQ artifacts, builds the shared G48 Any-K Lift graph, and runs the same
+query executable as the benchmark. The small input keeps this correctness
+test quick.
 
 ```bash
 ./scripts/run_sample.sh
 ```
 
-The sample uses four OpenMP threads for speed. Production measurements must
+The sample uses four OpenMP threads. To reproduce the reported measurements,
 use 64 threads and the warmed timing protocol.
 
 ## Reproduce with SIFT1M
@@ -162,7 +159,7 @@ Run the final search only through the pinned wrapper:
 ```
 
 The first argument is a data prefix and the second is the query k. The wrapper
-uses the production defaults `leaf=500`, `trees=64`, `ef=600`, graph degree
+uses the reported defaults `leaf=500`, `trees=64`, `ef=600`, graph degree
 `48`, and a representative `L_descent` sweep. Cache files are placed beside
 the prefix unless `ANQI_RUN_ROOT` is supplied by the wrapper.
 
@@ -187,7 +184,7 @@ products so that the same ascending comparison is used.
 
 ## Reproducibility notes
 
-The sample and benchmark invoke the production C++ binaries. Keep datasets
+The sample and benchmark invoke the same C++ binaries. Keep datasets
 and generated indexes in an isolated run directory, and record the compiler,
 OpenMP thread count, machine, input checksums, construction summary, and
 warmed-search summary alongside the results.

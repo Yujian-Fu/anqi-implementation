@@ -1,8 +1,4 @@
-// =============================================================================
-//  rknn_query.cpp —— reverse-kNN 端到端驱动（S4/S5，固定 k）
-//   ① 在 lifted ō（d+2 维）上建定长图 ② 每 query: q̄=[q,1,0], R²=M*²+1, range_search
-//   ③ recheck δ(q,o)²≤r_k²(o)（原始 o）滤假阳 ④ 对 rknn GT 算 recall/precision/F1
-// =============================================================================
+// ANQI reverse-kNN graph construction, search, and verification driver.
 #include "../include/index.h"
 #include "../include/packed_code_array.h"
 #include <algorithm>
@@ -17,7 +13,6 @@
 #include <limits>
 #include <unordered_set>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(__GLIBC__)
@@ -26,8 +21,35 @@
 using namespace nndgraph;
 
 static float* load_fbin(const std::string& p, size_t& n, size_t& d) {
-    std::ifstream f(p, std::ios::binary); uint32_t nn,dd; f.read((char*)&nn,4); f.read((char*)&dd,4);
-    n=nn; d=dd; float* x=static_cast<float*>(_mm_malloc((size_t)n*d*4,64)); f.read((char*)x,(size_t)n*d*4); return x;
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) {
+        fprintf(stderr, "[rknn] cannot open fbin: %s\n", p.c_str());
+        exit(3);
+    }
+    const std::streamoff bytes = f.tellg();
+    f.seekg(0);
+    uint32_t nn = 0, dd = 0;
+    if (bytes < 8 || !f.read(reinterpret_cast<char*>(&nn), 4) ||
+        !f.read(reinterpret_cast<char*>(&dd), 4) || nn == 0 || dd == 0) {
+        fprintf(stderr, "[rknn] invalid fbin header: %s\n", p.c_str());
+        exit(3);
+    }
+    const uint64_t values = static_cast<uint64_t>(nn) * dd;
+    const uint64_t expected = 8 + values * sizeof(float);
+    if (expected != static_cast<uint64_t>(bytes) ||
+        values > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        fprintf(stderr, "[rknn] invalid fbin size: %s\n", p.c_str());
+        exit(3);
+    }
+    float* x = static_cast<float*>(_mm_malloc(values * sizeof(float), 64));
+    if (!x || !f.read(reinterpret_cast<char*>(x), values * sizeof(float))) {
+        fprintf(stderr, "[rknn] cannot read fbin values: %s\n", p.c_str());
+        _mm_free(x);
+        exit(3);
+    }
+    n = nn;
+    d = dd;
+    return x;
 }
 
 static float* load_u8bin_as_float(const std::string& path, size_t& n, size_t& d) {
@@ -1522,31 +1544,83 @@ static void apply_l2_radius_relax(
 }
 
 int main(int argc, char** argv) {
-    // argv[1] = L_descent 逗号列表(如 "100,300,1000"):建一次索引,循环搜索各 L_descent
+    if (argc < 3 || argc > 8) {
+        fprintf(stderr,
+                "usage: %s L_DESCENT_LIST PREFIX [GRAPH_DEGREE] [LEAF_SIZE] "
+                "[TREE_COUNT] [BUILD_EF] [QUERY_K]\n",
+                argv[0]);
+        return 2;
+    }
+
+    auto parse_size = [](const char* text, const char* name, size_t& out) {
+        if (!text || !*text) {
+            fprintf(stderr, "[rknn] invalid %s (expected a positive integer)\n", name);
+            return false;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long value = std::strtoull(text, &end, 10);
+        if (errno == ERANGE || end == text || *end != '\0' ||
+            value == 0 || value > std::numeric_limits<size_t>::max()) {
+            fprintf(stderr, "[rknn] invalid %s=%s (expected a positive integer)\n",
+                    name, text);
+            return false;
+        }
+        out = static_cast<size_t>(value);
+        return true;
+    };
+
     std::vector<size_t> Lds;
-    if (argc > 1) { char* s=strdup(argv[1]); for(char*t=strtok(s,",");t;t=strtok(0,","))Lds.push_back(atoi(t)); }
-    if (Lds.empty()) Lds.push_back(300);
-    size_t Marg = (argc > 3) ? atoi(argv[3]) : 48;   // argv[3] = 图度数 M(≤M 条边/点,非 HNSW 的 2M)。默认 48(range 甜点)
-    // ★ 原始 kNN 参数(每数据集默认,见 defaults.sh):argv[4]=leaf [5]=n_trees [6]=ef。默认 SIFT(1000/64/400)
-    size_t leafA = (argc > 4) ? atoi(argv[4]) : 1000;
-    size_t ntA   = (argc > 5) ? atoi(argv[5]) : 64;
-    size_t efA   = (argc > 6) ? atoi(argv[6]) : 400;
-    // argv[2] = 数据集 prefix（如 /data00/.../Music100/Music100）；默认 SIFT1M
-    std::string PFX = (argc > 2) ? argv[2] : "/data00/home/yujian.fu/Dataset/SIFT1M/SIFT1M";
+    std::string list(argv[1]);
+    size_t start = 0;
+    while (start <= list.size()) {
+        const size_t comma = list.find(',', start);
+        const std::string item = list.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        size_t value = 0;
+        if (!parse_size(item.c_str(), "L_DESCENT", value)) return 2;
+        Lds.push_back(value);
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+
+    size_t Marg = 48;
+    size_t leafA = 1000;
+    size_t ntA = 64;
+    size_t efA = 400;
+    if (argc > 3 && !parse_size(argv[3], "GRAPH_DEGREE", Marg)) return 2;
+    if (argc > 4 && !parse_size(argv[4], "LEAF_SIZE", leafA)) return 2;
+    if (argc > 5 && !parse_size(argv[5], "TREE_COUNT", ntA)) return 2;
+    if (argc > 6 && !parse_size(argv[6], "BUILD_EF", efA)) return 2;
+
+    const std::string PFX(argv[2]);
     std::string lifted = PFX + "_lifted_base.bin";
     std::string meta_p = PFX + "_lifted.meta";
     std::string rk_p   = PFX + "_rknn_gt.bin.rk";
     std::string gt_p   = PFX + "_rknn_gt.bin";
 
-    // meta: M*², d, rk_k, metric, scale（缩放因子 s：lift 在 o'=o·s 上，q 也要缩放）
-    std::ifstream mf(meta_p); double Mstar2; size_t d0, kk; std::string metric="l2"; double scale=1.0;
-    mf >> Mstar2 >> d0 >> kk >> metric >> scale;
+    // Metadata fields: Mstar^2, dimension, rank horizon, metric, and scale.
+    std::ifstream mf(meta_p);
+    double Mstar2 = 0.0;
+    size_t d0 = 0;
+    size_t kk = 0;
+    std::string metric;
+    double scale = 0.0;
+    if (!(mf >> Mstar2 >> d0 >> kk >> metric >> scale) ||
+        !std::isfinite(Mstar2) || Mstar2 < 0.0 || d0 == 0 || kk == 0 ||
+        (metric != "l2" && metric != "ip") ||
+        !std::isfinite(scale) || scale <= 0.0) {
+        fprintf(stderr, "[rknn] invalid or missing lift metadata: %s\n",
+                meta_p.c_str());
+        return 3;
+    }
     bool is_ip = (metric=="ip");
-    printf("[rknn] metric=%s M*^2=%.6g  d=%zu k=%zu  (%zu 个 L_descent,建一次索引循环搜)\n", metric.c_str(), Mstar2, d0, kk, Lds.size());
+    printf("[rknn] metric=%s M*^2=%.6g d=%zu k=%zu L_descent_points=%zu\n",
+           metric.c_str(), Mstar2, d0, kk, Lds.size());
 
     // The verifier stores r_1..r_NK. By default the graph also lifts with
     // r_NK; ANQI_GRAPH_NK decouples graph geometry from verifier coverage for
-    // the horizon-generalization ablation.
+    // the horizon generalization experiment.
     size_t NK = 100;
     if (const char* nk_env = std::getenv("ANQI_NK")) {
         char* end = nullptr;
@@ -1573,7 +1647,8 @@ int main(int argc, char** argv) {
         }
         GRAPH_NK = (size_t)parsed;
     }
-    size_t Kq = (argc > 7) ? (size_t)atoi(argv[7]) : kk;
+    size_t Kq = kk;
+    if (argc > 7 && !parse_size(argv[7], "QUERY_K", Kq)) return 2;
     if (Kq < 1 || Kq > NK) {
         fprintf(stderr, "[rknn] requested Kq=%zu is outside the Any-K horizon [1,%zu]\n", Kq, NK);
         return 2;
@@ -1599,21 +1674,72 @@ int main(int argc, char** argv) {
     printf("[rknn] any-k: Kq=%zu NK=%zu graph_NK=%zu GT=%s\n",
            Kq, NK, GRAPH_NK, gt_p.c_str());
 
-    // 原始 base + query（recheck/lift 用）
+    // Original vectors are used by lifting and exact candidate verification.
     size_t n, d, nq, dq; float* base = load_base_vectors(PFX+"_base.bin", n, d);
     float* query = load_fbin(PFX+"_query.bin", nq, dq);
-    // r_k²
-    std::ifstream rf(rk_p, std::ios::binary); uint32_t rn, rkk; rf.read((char*)&rn,4); rf.read((char*)&rkk,4);
-    std::vector<float> rk2(rn); rf.read((char*)rk2.data(), (size_t)rn*4);
-    // rknn GT (CSR)
-    std::ifstream gf(gt_p, std::ios::binary); uint32_t gnq; gf.read((char*)&gnq,4);
-    std::vector<uint32_t> goff(gnq+1); gf.read((char*)goff.data(), (size_t)(gnq+1)*4);
-    std::vector<uint32_t> gids(goff[gnq]); gf.read((char*)gids.data(), (size_t)goff[gnq]*4);
+    if (d != d0 || dq != d0) {
+        fprintf(stderr,
+                "[rknn] vector dimension does not match lift metadata: "
+                "base=%zu query=%zu metadata=%zu\n",
+                d, dq, d0);
+        return 3;
+    }
+
+    // Load the rank-horizon threshold source.
+    std::ifstream rf(rk_p, std::ios::binary | std::ios::ate);
+    const std::streamoff rk_bytes = rf
+        ? static_cast<std::streamoff>(rf.tellg())
+        : static_cast<std::streamoff>(-1);
+    rf.seekg(0);
+    uint32_t rn = 0, rkk = 0;
+    if (!rf || rk_bytes != static_cast<std::streamoff>(8 + n * sizeof(float)) ||
+        !rf.read(reinterpret_cast<char*>(&rn), 4) ||
+        !rf.read(reinterpret_cast<char*>(&rkk), 4) || rn != n || rkk != kk) {
+        fprintf(stderr, "[rknn] invalid rank-threshold source: %s\n", rk_p.c_str());
+        return 3;
+    }
+    std::vector<float> rk2(n);
+    if (!rf.read(reinterpret_cast<char*>(rk2.data()), n * sizeof(float))) {
+        fprintf(stderr, "[rknn] truncated rank-threshold source: %s\n", rk_p.c_str());
+        return 3;
+    }
+
+    // Load reverse-kNN ground truth in CSR form. The file also contains one
+    // float key per id after the id array.
+    std::ifstream gf(gt_p, std::ios::binary | std::ios::ate);
+    const std::streamoff gt_bytes = gf
+        ? static_cast<std::streamoff>(gf.tellg())
+        : static_cast<std::streamoff>(-1);
+    gf.seekg(0);
+    uint32_t gnq = 0;
+    if (!gf || !gf.read(reinterpret_cast<char*>(&gnq), 4) || gnq != nq) {
+        fprintf(stderr, "[rknn] invalid reverse-kNN GT header: %s\n", gt_p.c_str());
+        return 3;
+    }
+    std::vector<uint32_t> goff(static_cast<size_t>(gnq) + 1);
+    if (!gf.read(reinterpret_cast<char*>(goff.data()), goff.size() * sizeof(uint32_t)) ||
+        goff.front() != 0 ||
+        !std::is_sorted(goff.begin(), goff.end())) {
+        fprintf(stderr, "[rknn] invalid reverse-kNN GT offsets: %s\n", gt_p.c_str());
+        return 3;
+    }
+    const uint64_t expected_gt_bytes = 4 + goff.size() * sizeof(uint32_t) +
+        static_cast<uint64_t>(goff.back()) * (sizeof(uint32_t) + sizeof(float));
+    if (gt_bytes < 0 || static_cast<uint64_t>(gt_bytes) != expected_gt_bytes) {
+        fprintf(stderr, "[rknn] invalid reverse-kNN GT size: %s\n", gt_p.c_str());
+        return 3;
+    }
+    std::vector<uint32_t> gids(goff.back());
+    if (!gf.read(reinterpret_cast<char*>(gids.data()), gids.size() * sizeof(uint32_t)) ||
+        std::any_of(gids.begin(), gids.end(), [n](uint32_t id) { return id >= n; })) {
+        fprintf(stderr, "[rknn] invalid reverse-kNN GT ids: %s\n", gt_p.c_str());
+        return 3;
+    }
 
     std::string DSDIR = PFX.substr(0, PFX.rfind('/')+1);
     const std::string graph_cache_dir = cache_dir_prefix("ANQI_GRAPH_CACHE_DIR", DSDIR);
     const std::string verifier_cache_dir = cache_dir_prefix("ANQI_VERIFIER_CACHE_DIR", DSDIR);
-    auto tb0 = std::chrono::steady_clock::now();        // build 计时起点
+    auto tb0 = std::chrono::steady_clock::now();
     std::string approxlift = DSDIR+"_approxlift.bin";
     std::string rk2a_file  = DSDIR+"_anqi_rk2a.bin";
     std::string rankm_resid_file = DSDIR+"_anqi_rankm_residual.bin";
@@ -1622,7 +1748,19 @@ int main(int argc, char** argv) {
     std::string graph_state_file = DSDIR+"_anqi_graph_state.txt";
     auto fexists=[](const std::string&p){ std::ifstream f(p); return f.good(); };
     std::string radius_mode = std::getenv("ANQI_RADIUS_MODE") ? std::getenv("ANQI_RADIUS_MODE") : "approx";
-    int RANKM = std::getenv("ANQI_RANKM") ? atoi(std::getenv("ANQI_RANKM")) : 0;
+    int RANKM = 0;
+    if (const char* rankm_env = std::getenv("ANQI_RANKM")) {
+        char* end = nullptr;
+        errno = 0;
+        const long value = std::strtol(rankm_env, &end, 10);
+        if (!*rankm_env || errno == ERANGE || end == rankm_env || *end != '\0' ||
+            value < 0 || value > 1024) {
+            fprintf(stderr, "[rknn] invalid ANQI_RANKM=%s (expected integer in [0,1024])\n",
+                    rankm_env);
+            return 2;
+        }
+        RANKM = static_cast<int>(value);
+    }
     const std::string graph_geometry = resolve_graph_geometry(RANKM);
     const bool graph_uses_rankm = (graph_geometry == "rankm");
     const bool graph_anyk_lift = (graph_geometry == "anyk_lift");
@@ -1759,7 +1897,7 @@ int main(int argc, char** argv) {
     auto read_text=[](const std::string&p){ std::ifstream f(p); std::string s; std::getline(f,s); return s; };
     const std::string& state_file = postfilter_verifier ? graph_state_file : radius_mode_file;
     bool radius_cache_match = fexists(state_file) && read_text(state_file) == cache_state_key;
-    // ★ save/load:已建过(marker+approxlift+rk2a+meta 都在)→ 直接 load,跳过 kNN+lift+建图。
+    // Reuse the graph only when its state key and all required artifacts match.
     bool can_load = radius_cache_match && fexists(marker) && fexists(graph_vector_file) && fexists(meta_file) &&
                     (postfilter_verifier ||
                      (fexists(rk2a_file) && (!is_rankm_residual_mode(radius_mode) || fexists(rankm_resid_file))));
@@ -1774,27 +1912,56 @@ int main(int argc, char** argv) {
         exit(3);
     }
 
-    // ★ rank-M unify 开关 + 载基(build/load 两路都要:build 算 c_i,search 算 g(k))。M=0 退回原版单 r+表。
-    std::vector<float> Gba, muba;   // G: RANKM×NK(行 g_i over k);mu: NK
+    // The rank-M basis is needed during both construction and search.
+    std::vector<float> Gba, muba;
     const bool needs_rankm_basis = GRAPH_RANKM > 0 || is_rankm_residual_mode(radius_mode) ||
                                    is_rankm_only_mode(radius_mode);
     if (needs_rankm_basis) {
         std::string rb = PFX + "_radbasis_M" + std::to_string(RANKM) + ".bin";
-        std::ifstream bf(rb, std::ios::binary); if(!bf){fprintf(stderr,"[rknn] 缺基 %s\n",rb.c_str()); exit(1);}
-        int Kb, Mb; bf.read((char*)&Kb,4); bf.read((char*)&Mb,4);
-        if((size_t)Kb!=NK||Mb!=RANKM){fprintf(stderr,"[rknn] 基 K=%d M=%d ≠ NK=%zu RANKM=%d\n",Kb,Mb,NK,RANKM);exit(1);}
+        std::ifstream bf(rb, std::ios::binary | std::ios::ate);
+        const std::streamoff basis_bytes = bf
+            ? static_cast<std::streamoff>(bf.tellg())
+            : static_cast<std::streamoff>(-1);
+        bf.seekg(0);
+        int Kb = 0, Mb = 0;
+        if (!bf || !bf.read(reinterpret_cast<char*>(&Kb), 4) ||
+            !bf.read(reinterpret_cast<char*>(&Mb), 4) || Kb <= 0 || Mb <= 0 ||
+            static_cast<size_t>(Kb) != NK || Mb != RANKM) {
+            fprintf(stderr,
+                    "[rknn] missing or invalid rank-M basis %s "
+                    "(K=%d M=%d, expected K=%zu M=%d)\n",
+                    rb.c_str(), Kb, Mb, NK, RANKM);
+            return 3;
+        }
+        const uint64_t expected_basis_bytes = 8 +
+            static_cast<uint64_t>(Kb) * sizeof(float) +
+            static_cast<uint64_t>(Mb) * Kb * sizeof(float);
+        if (basis_bytes < 0 ||
+            static_cast<uint64_t>(basis_bytes) != expected_basis_bytes) {
+            fprintf(stderr, "[rknn] invalid rank-M basis size: %s\n", rb.c_str());
+            return 3;
+        }
         muba.resize(Kb); Gba.resize((size_t)Mb*Kb);
-        bf.read((char*)muba.data(),(std::streamsize)Kb*4); bf.read((char*)Gba.data(),(std::streamsize)Mb*Kb*4);
-        printf("[rknn] rank-M unify: M=%d 载基 %s (对称几何 any-k)\n", RANKM, rb.c_str());
+        if (!bf.read(reinterpret_cast<char*>(muba.data()),
+                     static_cast<std::streamsize>(Kb) * sizeof(float)) ||
+            !bf.read(reinterpret_cast<char*>(Gba.data()),
+                     static_cast<std::streamsize>(Mb) * Kb * sizeof(float))) {
+            fprintf(stderr, "[rknn] truncated rank-M basis: %s\n", rb.c_str());
+            return 3;
+        }
+        printf("[rknn] loaded rank-M basis: M=%d path=%s\n", RANKM, rb.c_str());
     }
-    // lifted index 参数(两分支共用)
+    // Shared lifted-index parameters.
     Parms par; par.n=n;
     par.dim = graph_original ? (uint32_t)d
                              : (uint32_t)(d + (GRAPH_RANKM > 0 ? GRAPH_RANKM : 0) + 2);
     par.meric="l2"; par.random_seed=10;
-    par.nn_k = std::getenv("ANQI_LIFTNNK") ? atoi(std::getenv("ANQI_LIFTNNK")) : 50;   // ★ lift kNN 度(env)
+    par.nn_k = 50;
+    if (const char* lift_nnk = std::getenv("ANQI_LIFTNNK")) {
+        if (!parse_size(lift_nnk, "ANQI_LIFTNNK", par.nn_k)) return 2;
+    }
     par.M=Marg; par.leaf_size=100; par.max_depth=100; par.n_trees=64;
-    par.ef_alpha=8; par.prune_alpha = std::getenv("ANQI_ALPHA") ? (float)atof(std::getenv("ANQI_ALPHA")) : 1.2f;   // ★ RNG 剪枝松弛(env)
+    par.ef_alpha=8; par.prune_alpha = std::getenv("ANQI_ALPHA") ? (float)atof(std::getenv("ANQI_ALPHA")) : 1.2f;
     par.explore_range=100; par.n_threads=64;
     par.folder_path=postfilter_verifier ? graph_cache_dir : DSDIR;
 
@@ -1904,7 +2071,7 @@ int main(int argc, char** argv) {
     double lift_verifier_prepare_s = 0.0;
     double graph_index_s = 0.0;
     if (can_load) {
-        // ===== LOAD: 跳过 kNN+lift+建图,直接载已存盘 =====
+        // Load compatible cached construction artifacts.
         if (!postfilter_verifier) {
             read_binary_exact(rk2a_file, rk2a_all.data(), float_table_bytes(n, NK, "rk2a"), "rk2a");
             if (is_rankm_residual_mode(radius_mode)) {
@@ -1932,11 +2099,11 @@ int main(int argc, char** argv) {
         printf("[rknn] LOAD 已存索引 (M=%zu): 跳过 kNN+lift+build, M*^2=%.6g scale=%.4g radius=%s\n",
                Marg, Mstar2, scale, radius_mode_desc.c_str());
     } else {
-        // ===== BUILD: 原始 kNN(复用为图 init)→ 近似 r̂_k + lift,全部存盘 =====
-        Parms po; po.n=n; po.dim=d; po.meric=metric; po.random_seed=10;   // ★ IP 数据集用 ip kNN
-        po.nn_k=100; po.M=32; po.leaf_size=leafA; po.max_depth=100; po.n_trees=ntA;   // ★ 每数据集参数
+        // Build the original-space AKNN warm start, thresholds, and lift.
+        Parms po; po.n=n; po.dim=d; po.meric=metric; po.random_seed=10;
+        po.nn_k=100; po.M=32; po.leaf_size=leafA; po.max_depth=100; po.n_trees=ntA;
         po.ef_alpha=8; po.prune_alpha=1.2f; po.explore_range=efA; po.n_threads=64;
-        printf("[rknn] 原始 kNN 参数: leaf=%zu n_trees=%zu ef=%zu (%s)\n", leafA, ntA, efA, metric.c_str());
+        printf("[rknn] original-space AKNN: leaf=%zu n_trees=%zu ef=%zu metric=%s\n", leafA, ntA, efA, metric.c_str());
         po.folder_path=DSDIR;
         std::vector<std::vector<float>> dist_orig;
         const auto original_knn_t0 = std::chrono::steady_clock::now();
@@ -2072,7 +2239,7 @@ int main(int argc, char** argv) {
                     for(size_t k=0;k<NK;k++) c+=((double)rk[k]-(double)muba[k])*(double)gm[k];   // c_i=(rk2a−μ)·G_i
                     h[d+1+m]=(float)((is_ip?1.0:0.5)*sc2*c); }      // IP: s²c_i;L2: ½s²c_i
                 double hn2=0; for(uint32_t j=0;j<dl;j++) hn2+=(double)h[j]*h[j]; if(hn2>maxn2)maxn2=hn2;
-            } else {                                               // 原版单 r + 外挂表
+            } else {
                 size_t lk_=std::getenv("ANQI_SPECIFIC")?Kq:NK;
                 float rmax_=postfilter_verifier ? graph_horizon_radius[i]
                                                 : rk2a_all[(size_t)i*NK+(lk_-1)];
@@ -2084,7 +2251,7 @@ int main(int argc, char** argv) {
         { std::ofstream of(approxlift,std::ios::binary); of.write((char*)&N,4); of.write((char*)&dout,4);
           std::vector<float> ob(dout);
           for(size_t i=0;i<n;i++){const float*h=hat.data()+i*dl; double hn2=0; for(uint32_t j=0;j<dl;j++){ob[j]=h[j];hn2+=(double)h[j]*h[j];}
-            double pad=Mstar2-hn2; if(pad<0)pad=0; ob[dl]=(float)std::sqrt(pad); of.write((char*)ob.data(),dout*4);} }  // ★ pad 在 dl(rank-M 是 d+1+M,单r 退化为 d+1)
+            double pad=Mstar2-hn2; if(pad<0)pad=0; ob[dl]=(float)std::sqrt(pad); of.write((char*)ob.data(),dout*4);} }
         }
         if (!postfilter_verifier) {
             { std::ofstream f(rk2a_file, std::ios::binary); f.write((char*)rk2a_all.data(), (std::streamsize)n*NK*4); }
@@ -2182,10 +2349,9 @@ int main(int argc, char** argv) {
     double idx_gb = ((double)n*par.M*4 + (double)n*(double)par.dim*4 +
                      (double)conceptual_verification_bytes +
                      (double)conceptual_envelope_bytes)/1e9;
-    struct rusage ru_b; getrusage(RUSAGE_SELF, &ru_b);
-    printf("[rknn] BUILD_TIME=%.1fs  INDEX_MEM=%.2fGB  PEAK_RSS=%.2fGB "
+    printf("[rknn] BUILD_TIME=%.1fs INDEX_SIZE=%.2fGB "
            "(graph M=%zu + graph dim=%zu + verification=%.3fGB + envelope=%.3fGB)\n",
-           build_s, idx_gb, ru_b.ru_maxrss/1048576.0, par.M, par.dim,
+           build_s, idx_gb, par.M, par.dim,
            conceptual_verification_bytes / 1e9, conceptual_envelope_bytes / 1e9);
     if (env_flag("ANQI_BUILD_BREAKDOWN")) {
         printf("[rknn] BUILD_BREAKDOWN mode=%s original_knn_s=%.6f "
@@ -2196,9 +2362,8 @@ int main(int argc, char** argv) {
                verifier_encode_save_ms, verifier_load_ms);
     }
 
-    // ★ k-自适应 flood 的 per-o 阈值:radj[o]=s²(r_Kq²−r_graph²)。
-    //   Kq 在 graph horizon 内时 radj≤0；解析 Rank-M 外推到更大 k 时 radj>0。
-    //   IP 的 lifted 因子不同,暂用 nullptr(全 flood)。beta 余量从 env ANQI_BETA(默认 0.5)。
+    // L2 adaptive flooding uses radj[o] = scale^2 * (r_Kq^2 - r_graph^2).
+    // IP uses the global flood because its lifted factor differs.
     std::vector<float> radj; const float* radjp = nullptr;
     float beta = std::getenv("ANQI_BETA") ? (float)atof(std::getenv("ANQI_BETA"))
                                            : (graph_original ? 0.0f : 0.5f);
@@ -2208,9 +2373,8 @@ int main(int argc, char** argv) {
                 "r100 envelope exactly matches the lifted arm; got %.6g\n", beta);
         exit(2);
     }
-    // ★ rank-M 可选精确复核:recheck 模式下把收集阈值放宽到 flood 探到的全集(collect_eps),候选再按原始空间 r_k 精确过滤。
-    //   默认全关 → 行为与现版完全一致。放宽幅度:IP(radj=null)由 RCEPS 控(thrE=R2·(1+RCEPS)²);L2(radj!=null)由 ANQI_BETA 控(thrE=R2+radj·(1−beta),beta→1 放到 r_100)。
-    //   RCEPS=0 且 beta 默认 → 收集集=严格 r_k,recheck 只滤假阳(提 precision、召回不变);放宽后 recheck 同时拉回召回。
+    // Optional exact recheck collects the flood envelope and then evaluates
+    // each candidate against its original-space rank-k threshold.
     int   RECHECK = env_flag("ANQI_RECHECK") ? 1 : 0;
     float RCEPS   = std::getenv("ANQI_RCEPS") ? (float)atof(std::getenv("ANQI_RCEPS")) : 0.0f;
     if (graph_original && RCEPS != 0.0f) {
@@ -2222,7 +2386,7 @@ int main(int argc, char** argv) {
     if (postfilter_verifier && RECHECK) {
         fprintf(stderr,
                 "[rknn] ANQI_RECHECK cannot be mixed with an independent postfilter verifier; "
-                "select ANQI_RADIUS_MODE=exact_f32 for the exact component A/B\n");
+                "select ANQI_RADIUS_MODE=exact_f32 for the exact component comparison\n");
         exit(2);
     }
     bool  collect_eps = (RECHECK != 0) && !postfilter_verifier;
@@ -2405,7 +2569,7 @@ int main(int argc, char** argv) {
                ? (double)query_threads * ((n + 63) / 64) * sizeof(uint64_t) / 1e9
                : (double)query_threads * n * sizeof(uint16_t) / 1e9);
 
-    // ★ warmup(不计时):预热 OpenMP 线程 + page-in 索引,消除 load 后冷启动导致的 QPS 偏低
+    // Warm OpenMP workers and page in the index before timed queries.
     {
         size_t Lw = Lds.back();
         #pragma omp parallel
@@ -2585,8 +2749,8 @@ int main(int argc, char** argv) {
                         if (recheck_key(id, q) <= (double)verification_thresholds[id]) pred.insert(id);
                     ndist += cand.size();
                 } else if(GRAPH_RANKM>0){
-                    if(RECHECK){ for(uint32_t id:cand) if(recheck_key(id,q) <= recheck_radii[(size_t)id*NK+(Kq-1)]) pred.insert(id); ndist += cand.size(); }  // ★ 精确复核:候选按原始 r_k 过滤,复核距离计入 #dist
-                    else for(uint32_t id:cand) pred.insert(id);   // 候选即答案,无 recheck
+                    if(RECHECK){ for(uint32_t id:cand) if(recheck_key(id,q) <= recheck_radii[(size_t)id*NK+(Kq-1)]) pred.insert(id); ndist += cand.size(); }
+                    else for(uint32_t id:cand) pred.insert(id);
                 }
                 else if (anyk_rankm_verification && !RECHECK) {
                     for (uint32_t id : cand) pred.insert(id);  // rank-M+RQ predicate already folded into Any-K Lift threshold.
@@ -2686,7 +2850,7 @@ int main(int argc, char** argv) {
                 stats.sum_graph_search_s + stats.sum_verifier_s + stats.sum_eval_s;
             printf("[rknn] TIME_BREAKDOWN L_descent=%zu transform_us=%.3f graph_search_us=%.3f "
                    "verification_us=%.3f benchmark_eval_us=%.3f stage_cpu_us=%.3f "
-                   "wall_us=%.3f tasks=%zu\n",
+                   "elapsed_us=%.3f tasks=%zu\n",
                    L_descent, stats.sum_transform_s * task_scale_us,
                    stats.sum_graph_search_s * task_scale_us,
                    stats.sum_verifier_s * task_scale_us,
@@ -2695,7 +2859,7 @@ int main(int argc, char** argv) {
         }
     };
 
-    for (size_t L_descent : Lds) {  // 索引已建好,循环各 L_descent 只搜不重建
+    for (size_t L_descent : Lds) {
         if (!calibrated_timing) {
             const PointStats stats = run_point(L_descent, bench_repeats);
             print_point(

@@ -1,26 +1,5 @@
 #pragma once
-// =============================================================================
-//  heap.h —— HeapList：Vista 邻近图索引的图存储核心
-// -----------------------------------------------------------------------------
-//  整张图就存在这里。对每个数据点 i 维护三组并行数组：
-//
-//      indices[i]          点 i 的出边邻居 id（邻接表）
-//      values[i]           对应距离 distance(i, indices[i][j])（与 indices 平行）
-//      reverse_indices[i]  点 i 的入边邻居 id（谁指向 i）
-//
-//  indices[i] 在构建过程中有“双重身份”：
-//    1. 初始化阶段 —— 它是容量固定为 nn_k 的【二叉最大堆】（按距离），所以
-//       values[i][0] 永远是【当前最远】的邻居。新候选用 check_push 压入，满了就
-//       淘汰最远的那个。用最大堆正是为了 O(1) 找到最差邻居、O(log k) 替换。
-//    2. 调用 sort_heap_by_dist() 之后 —— 它被重新解释为【按距离升序的邻接表】
-//       （values[i][0] = 最近），这是选边 / 搜索代码期望的形态。
-//
-//  reverse_indices 同步维护，便于构建器低成本地问“谁把 i 当成出边邻居？”。这个
-//  入度正是 Vista 分布感知边预算的依据（入度低 == 难被检索到的点）。
-//
-//  并发：每个点一把锁 mtxs[i]。任何修改 indices[i]/values[i]/reverse_indices[i]
-//  的代码都必须持有 mtxs[i]。锁总是一次只持有一个 id（或先释放再取下一个），避免死锁。
-// =============================================================================
+// Fixed-capacity neighbor heaps used during AKNN graph construction.
 
 #include "utils.h"
 #include <cstdlib>
@@ -177,10 +156,9 @@ public:
         return true;
     }
 
-    // 无锁版 check_push（update_reverse=false 语义）。
-    // ★ 仅当调用方保证【heap_idx 被单线程独占】时安全 —— per-tree 叶内共现即满足：
-    //   一棵树内叶子是对点的划分，每个点恰在一个叶子→只有一个线程碰它的堆。
-    //   去掉 mutex，省掉 init_knn 里 ~3.2e11 次锁(大 leaf 的主瓶颈)。
+    // Lock-free check_push for update_reverse=false. The caller must give one
+    // thread exclusive ownership of heap_idx. Per-tree leaf processing has
+    // this property because the leaves partition the data points.
     bool push_nolock(uint32_t heap_idx, uint32_t node_idx, float value, uint8_t mark_new = 1)
     {
         if (value > values[heap_idx][0]) return false;

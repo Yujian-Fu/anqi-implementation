@@ -1,17 +1,5 @@
 #pragma once
-// =============================================================================
-//  rptrees.h —— 随机投影树（Random Projection Tree）森林
-// -----------------------------------------------------------------------------
-//  两个用途：
-//    1. 初始化 kNN 图 —— 同一叶子里的点互为近邻候选（index.h 的 initialize_by_forest
-//       直接遍历叶子，对叶内点两两算距离塞进堆）。多棵随机树降低“漏掉真近邻”的概率。
-//    2. 查询入口点 —— search_tree = forest[0]，get_leave_mediod(query) 把查询沿树
-//       下行到一个叶子，返回该叶子的“叶心（medoid）”作为 beam search 的起点。
-//
-//  分割方式：随机取两个点，构造分割超平面（L2 用中点法向；angular 用归一化差向量），
-//  按点到超平面的 margin 符号二分；若全落一边则随机均分。
-//  原文件里注释掉的旧 get_leaf 实现、未使用的 forest 辅助函数已删除。
-// =============================================================================
+// Random-projection trees for AKNN initialization and query entry points.
 
 #include "utils.h"
 #include "distance.h"

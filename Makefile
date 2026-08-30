@@ -1,6 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -mavx512f -march=native -fopenmp -Iinclude
-LDFLAGS ?= -lboost_filesystem -lboost_system
+LDFLAGS ?=
 
 BIN_DIR := bin
 HEADERS := $(wildcard include/*.h)

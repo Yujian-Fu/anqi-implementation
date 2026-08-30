@@ -2,5 +2,9 @@ bin/dataset_gt
 bin/rknn_query
 sample/run/
 sample/data/
+data/
+__pycache__/
+*.py[cod]
+.DS_Store
 *.o
 *.d

@@ -1,14 +1,5 @@
 #pragma once
-// =============================================================================
-//  neighbor.h —— 查询期候选队列 NeighborPriorityQueue
-// -----------------------------------------------------------------------------
-//  beam search 用的“有序定长候选表 + 游标”。容量为 ef（搜索宽度）：
-//    - 始终按距离升序保存最近的 ef 个候选；
-//    - _cur 游标指向“首个尚未扩展（expanded=false）的候选”，
-//      closest_unexpanded() 取出它并标记已扩展，从而实现“每次扩展当前最近的未扩展点”。
-//  这正是 DiskANN/NSG 式贪心图搜索的核心结构（比两个 priority_queue 更省、更直观）。
-//  原文件里未使用的 SimpleNeighbor / SimpleNeighborPriorityQueue 已删除。
-// =============================================================================
+// Ordered fixed-capacity candidate queue for graph beam search.
 
 #include "utils.h"
 

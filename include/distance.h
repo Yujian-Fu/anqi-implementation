@@ -1,20 +1,5 @@
 #pragma once
-// =============================================================================
-//  distance.h —— AVX-512 距离计算层 DistCal
-// -----------------------------------------------------------------------------
-//  提供高维向量的 L2（平方）距离、内积、范数的 AVX-512 SIMD 实现，以及把
-//  字符串度量名（"l2"/"ip"/"ip_origin"）绑定到对应函数的 DistCal。
-//
-//  原文件里有多份功能重叠、未被调用的 SIMD 变体，已删除，只保留实际用到的：
-//    - L2SqrSIMD16ExtAVX512__       : "l2" 度量
-//    - inner_product / inner_product_dist : "ip_origin" / "ip" 度量（标量）
-//    - InnerProductSIMD16ExtAVX512_ : RP 树投影用（命名空间自由函数 + 类静态各一份）
-//    - InnerProductSIMD16ExtAVX512__: fast_l2 用（对齐 load）
-//    - NormSIMD16ExtAVX512__        : 预计算范数用
-//
-//  约定：每拍处理 16 个 float（512bit）。带尾部 mask 的版本能处理 dim 非 16 倍数；
-//  双下划线 "__" 版本用对齐 load（_mm512_load_ps），要求向量起始地址 64 字节对齐。
-// =============================================================================
+// AVX-512 distance kernels used by graph construction and search.
 
 #include <vector>
 #include <cmath>
@@ -164,7 +149,7 @@ public:
             sum = _mm512_fmadd_ps(v, v, sum); // sum += v^2
         }
         float res = _mm512_reduce_add_ps(sum);
-        uint32_t r = dim & 15;                          // dim % 16 余数：原版漏算 → 非16倍数维度 norm 错
+        uint32_t r = dim & 15;
         if (r) {                                        // 尾部 mask 补上(lifted 维度 d+2 等非16倍数必需)
             __mmask16 mask = (__mmask16)((1u << r) - 1);
             v = _mm512_maskz_loadu_ps(mask, pEnd1);

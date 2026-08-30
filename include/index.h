@@ -1,23 +1,5 @@
 #pragma once
-// =============================================================================
-//  index.h —— ANQI 定长图索引（fixed-degree, co-located, lock-free build）
-// -----------------------------------------------------------------------------
-//  设计要点（相对变长 CSR 版的根本改动）：
-//    1. 定长度数 M：每点恰好存 ≤M 条边，一次性 prune 到上限（不再无脑合并反向边）。
-//    2. co-located 单块存储：block_i = [vector(dim) | norm | deg | links(M) | pad]，
-//       64B 对齐。搜索每跳一次取 block 即拿到 向量+norm+边 → 一条内存流、直接寻址、
-//       无偏移表（变长 CSR 的 csr_offsets 二次寻址 + 额外内存流被消除）。
-//    3. lock-free 构建：gather(O_i) / reverse-scatter(原子计数) / final-prune(写独立 block)
-//       三段，最贵的 prune 段零锁（只读不可变 O/R，只写互不相交 block）。
-//
-//  构建流程 build_index：
-//    A 初始化 kNN 图（RP 树森林叶内共现，临时 HeapList）
-//    B 每点 beam-search 探候选 + RNG-prune → out-edges O_i        [无锁]
-//    C 由 O 反向 scatter 出 reverse 列表 R（2-pass CSR + atomic）  [无锁]
-//    D 每点 cand=O_i∪R_i → RNG-prune 到 M → 写 co-located block    [无锁]
-//
-//  查询 search_index_parallel：RP 树路由到入口叶心 → 定长块 beam-search → top-k。
-// =============================================================================
+// Fixed-degree, co-located proximity graph used by ANQI.
 
 #include "config.h"
 #include "rptrees.h"
@@ -801,7 +783,7 @@ public:
             return;
         }
         // LSG changes only the ordering and RNG occlusion metric. Candidate
-        // discovery remains shared with center-RNG for a controlled A/B.
+        // discovery is shared with center-RNG so the edge policies are comparable.
         if (edge_lsg_rng_ && edge_ball_rng_ && edge_lsg_alpha_ != 0.0) {
             std::vector<std::pair<double,uint32_t>> lsg_pool;
             lsg_sort_candidates(i, pool, lsg_pool);
@@ -870,8 +852,8 @@ public:
         }
     }
 
-    // ★ 旧全图重建路径用:在【当前定长图 lnk/deg】上从 RPT 入口贪心 beam 搜索 toward vec(i),收 visited 候选池。
-    //   无锁(只读图);thread_local 版本戳 visited。
+    // Collect candidates by greedy beam search over the current fixed-degree
+    // graph. The graph is read-only and visited state is thread-local.
     void greedy_collect(size_t i, std::vector<std::pair<float,uint32_t>>& pool, size_t Lb) {
         static thread_local std::vector<uint32_t> vmark; static thread_local uint32_t vver = 0;
         if (vmark.size() != n) { vmark.assign(n, 0); vver = 0; }
@@ -1121,27 +1103,25 @@ public:
             throw std::runtime_error("invalid streamed warm-start KNN layout");
         }
 
-        // 用临时连续向量数组建 RP 树（rptrees 假定 stride=dim；建完即弃）。
-        //  ★ lifted 空间【只建一棵 RPT】当查询入口(search_tree)——搜索本来就只用 forest[0]，
-        //    kNN init 改走"原始 kNN warm-start + NN-descent"(下面)，不再靠 RP 森林叶内共现，
-        //    所以无需建整片 forest。仅 init_nbr==null 的回退路径才建多树喂 init_knn。
+        // Build one RP tree over a temporary contiguous vector array for the
+        // query entry structure. AKNN initialization uses the original-space
+        // warm start followed by NN-Descent; the fallback path builds the full
+        // forest only when no initial neighbors are supplied.
         float* cvec = static_cast<float*>(_mm_malloc(n * dim * sizeof(float), 64));
         #pragma omp parallel for num_threads(n_threads) schedule(static)
         for (size_t i = 0; i < n; i++) std::memcpy(cvec + i * dim, vec(i), dim * sizeof(float));
 
-        size_t nt_build = has_init_nbr ? 1 : n_trees; // lifted 路径只要 1 棵(查询入口)
+        size_t nt_build = has_init_nbr ? 1 : n_trees;
         std::vector<rptree> forest = make_forest(cvec, n, dim, nt_build, leaf_size, angular, max_depth, random_seed, n_threads);
         search_tree = forest[0];
         graph_entry_ = choose_vamana_entry();
         _mm_free(cvec);
         rec.print_performance("make_forest (lifted, 1 tree for query entry)");
 
-        // A: 初始 kNN 图（临时 HeapList）
-        //  ★ 正解：kNN 关系必须在【本空间(lifted)】里选。lifted 几何(d+M+2,含半径曲线坐标)偏离原始
-        //    空间 → 原始空间的近邻 ≠ lifted 近邻。但原始 L2 的近似 kNN 是很好的【起点】(lifted≈原始
-        //    +小扰动)，所以：用原始 kNN 填 g0(重算 lifted d2) → 在 lifted d2 上继续 NN-descent 收敛
-        //    到本空间真 kNN → 再 gather/剪枝。NN-descent 是把 kNN 关系搬进 lifted 空间的关键一步。
-        //  ANQI_REUSE_ORIG_KNN=1：退回旧行为(原始 kNN init 后【不】NN-descent，直接建图)，仅供 A/B 对比。
+        // Initialize the temporary AKNN graph from original-space neighbors,
+        // recompute their lifted distances, and refine in lifted space with
+        // NN-Descent. ANQI_REUSE_ORIG_KNN=1 skips the lifted refinement for
+        // the corresponding component experiment.
         HeapList* g0 = new HeapList(n, nn_k, false);
         if (has_stream_init) {
             struct StreamKnnRecord {
@@ -1255,7 +1235,7 @@ public:
                     if (j != (uint32_t)i && j < n) g0->push_nolock(i, j, d2(i, j));
             rec.print_performance("init: 原始 kNN warm-start (重算 lifted d2)");
             if (!std::getenv("ANQI_REUSE_ORIG_KNN"))
-                nndescent_refine(g0, rec, 6);     // ★ 在 lifted d2 上 NN-descent 收敛到本空间真 kNN
+                nndescent_refine(g0, rec, 6);     // Refine using lifted-space distances.
         } else {
             init_knn(forest, g0);                 // 回退：lifted RP 森林叶内共现
             rec.print_performance("init_knn (lifted RP forest, fallback)");
@@ -1278,8 +1258,8 @@ public:
         commit_edges(O);                       // C+D:反向 scatter + 最终剪枝 → lnk/deg(初始图)
         rec.print_performance("commit initial graph");
 
-        // ★ Vamana/RNG refine(env ANQI_VAMANA):默认回到旧的 global pass，作为当前主线。
-        //   ANQI_VAMANA_STYLE=batch 只保留为显式 A/B 实验开关。
+        // Optional Vamana/RNG refinement. ANQI_VAMANA_STYLE=batch selects the
+        // batched component variant.
         if (std::getenv("ANQI_VAMANA")) {
             size_t Lb = (size_t)envi("ANQI_VAMANA_L", 128); int passes = envi("ANQI_VAMANA_PASS", 2);
             std::string style = std::getenv("ANQI_VAMANA_STYLE") ? std::getenv("ANQI_VAMANA_STYLE") : "global";
@@ -1288,7 +1268,7 @@ public:
                     #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 64)
                     for (size_t i = 0; i < n; i++) {
                         std::vector<std::pair<float,uint32_t>> pool; pool.reserve(Lb*2);
-                        greedy_collect(i, pool, Lb);                              // 旧路径:RPT 多入口
+                        greedy_collect(i, pool, Lb);                              // RP-tree entry points.
                         append_aknn_edges(i, g0, pool);                           // ∪ lifted AKNN
                         std::vector<uint32_t> ids;
                         prune_pool_to_ids(i, pool, ids);
@@ -1328,8 +1308,8 @@ public:
         HeapList* g0 = new HeapList(n, nn_k, false);
         init_knn(forest, g0);
         rec.print_performance("init_knn");
-        // ★ 迭代 NN-descent local join:便宜 init(小 leaf)+ 多趟邻居对 join 传播 → 高 recall,免大 leaf。
-        //   ANQI_NNITERS>0 启用(默认 0=旧单趟行为)。纯构建优化,kNN 质量同,结果不变。
+        // ANQI_NNITERS enables iterative NN-Descent local joins after the
+        // leaf-based initialization.
         {
             auto envi=[](const char*k,int d){const char*v=std::getenv(k);return v?atoi(v):d;};
             int nn_iters=envi("ANQI_NNITERS",0), nn_sample=std::min(envi("ANQI_NNSAMPLE",20),120);
@@ -1352,7 +1332,8 @@ public:
         }
         nbr.assign(n, {}); dist.assign(n, {});
         if (std::getenv("ANQI_SKIPGATHER")) {
-            // ★ 跳过 gather:直接用 NN-descent 精修后的 g0 当 kNN(top-k 排序)。测 gather 是否有用。
+            // Use the refined NN-Descent graph directly when candidate
+            // gathering is disabled for the component experiment.
             #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 256)
             for (size_t i = 0; i < n; i++) {
                 std::vector<std::pair<float,uint32_t>> p;
@@ -1384,14 +1365,13 @@ public:
         }
     }
 
-    // RP 森林叶内共现填初始 kNN 图（用 store_ 向量算距离）。
-    // ★ 无锁：per-tree 结构下，一棵树内叶子是对点的【划分】→ 每个点恰在一个叶子 →
-    //   它的堆只被一个线程碰 → push_nolock 安全。去掉 ~3.2e11 次锁(大 leaf 的主瓶颈)。
-    //   树之间串行(barrier)保证跨树无并发。
+    // Initialize the AKNN graph from points that share RP-tree leaves. Within
+    // one tree, leaves partition the points, so each heap has a single writer.
+    // Trees are processed sequentially.
     void init_knn(const std::vector<rptree>& forest, HeapList* g0) {
         size_t nt = forest.size();
         if (std::getenv("ANQI_FIXA")) {
-            // Fix A: 按点去重(每唯一候选算一次 d2),但候选散落 → 高维 cache miss 重,低维(数据驻 cache)才赚。
+            // The point-major variant computes each unique candidate distance once.
             std::vector<uint32_t> leafmap((size_t)nt * n, UINT32_MAX);   // [i*nt+t] 固定点连续
             for (size_t t = 0; t < nt; t++) {
                 const auto& nodes = forest[t].nodes;
@@ -1414,15 +1394,15 @@ public:
                             if (vmark[j] != vver) { vmark[j] = vver; g0->push_nolock((uint32_t)i, j, d2(i, (size_t)j)); }
                     }
                     size_t d = ++_ikdone;
-                    if (d % _ikstep == 0) fprintf(stderr, "  [init_knn-fixA] %3.0f%%\n", 100.0*d/n);
+                    if (d % _ikstep == 0) fprintf(stderr, "  [init_knn-point-major] %3.0f%%\n", 100.0*d/n);
                 }
             }
         } else {
-            // OLD per-leaf:cache 高效(叶内点数据复用,叶对算 d2);跨树冗余重算,但局部性补偿。树间串行 barrier。
-            // ★ ANQI_DEDUP=1(移植自 GIST worker, bit-identical 已证):跨树 visit-map 去重 ——
-            //   point-major leafmap 当无锁共现 oracle;d2(x,y) 前 SIMD 查 x,y 是否在更早树 t'<t 已同叶
-            //   (d2 已算过),是则跳。树间串行 barrier 保证 t'<t 列已定 → "最早共现树算,其余跳" 无损。
-            //   默认关 → 行为与原版完全一致。GIST/Deep 高维 build 提速用(init_knn ~1.3-2.3×, 随 nt 升)。
+            // The per-leaf path preserves vector locality. ANQI_DEDUP=1 uses
+            // the point-major leaf map to skip a pair already compared in an
+            // earlier tree. Sequential tree processing makes this check lock-free.
+            // Deduplication is opt-in because its benefit depends on dimension
+            // and the amount of cross-tree overlap.
             const bool dedup = std::getenv("ANQI_DEDUP") != nullptr;
             std::vector<uint32_t> lmap;
             if (dedup) {
@@ -1435,7 +1415,8 @@ public:
                 }
             }
             const uint32_t* LM = lmap.data();
-            // ⚠️ ANQI_DEDUP_MAXD 实测负结果(冗余不集中早期树),默认 0=full-scan,别开。
+            // ANQI_DEDUP_MAXD limits how many earlier trees are checked; zero
+            // scans all earlier trees.
             const size_t maxd = []{ const char* e = std::getenv("ANQI_DEDUP_MAXD"); return e ? (size_t)atoll(e) : 0; }();
             auto seen_before = [&](uint32_t x, uint32_t y, size_t tcur) -> bool {
                 const uint32_t* rx = LM + (size_t)x * nt;
@@ -1504,9 +1485,8 @@ public:
         }
     }
 
-    // 在初始图 g0 上对点 i 做 beam-search，收集候选池（含距离）。无锁（只读 g0）。
-    // ★ visited 用 thread_local 版本戳数组（分配一次，版本号 +1 当重置），
-    //   取代原来每点 new boost::dynamic_bitset<>(n)（O(n)/点 → O(n²) 总，125GB 清零的真凶）。
+    // Collect candidates for point i with read-only beam search over g0.
+    // A thread-local version-stamp array resets visited state in constant time.
     void gather_candidates(size_t i, HeapList* g0, std::vector<std::pair<float,uint32_t>>& pool, size_t cap) {
         static thread_local std::vector<uint32_t> vmark;
         static thread_local uint32_t vver = 0;
@@ -1540,17 +1520,14 @@ public:
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  Range search（reverse-kNN 用）：返回所有 ‖q-o‖² ≤ R2 的点 id。
-    //  标准图 range 范式：① 贪心 beam 下降到 q 邻域(L_descent 宽) ② ε-margin 有界泛洪收球内点。
-    //  ε(eps) 处理 RNG 剪枝图的连通性 gap：扩展半径 = R2·(1+eps)²，避免漏掉只能经"略出球桥接点"到达的球内点。
-    //  返回该查询的 #dist（距离计算次数）于 out_ndist。单查询版（验证/可并行包装）。
-    // -------------------------------------------------------------------------
-    // ★ k-自适应 flood:radj!=null 时每点用 per-o 阈值 R2+radj[o](= r_k(o) 的 lifted 阈值)。
-    //   k 在图 horizon 内时 radj≤0；解析 Any-K 外推到更大 k 时 radj>0。
-    //   exploration 对 radj≤0 在 target 与图 horizon 间留 beta 桥接余量；对 radj>0 至少
-    //   覆盖 collection target，避免原公式把探索圈缩到收集圈内。
-    //   radj=null 退回全局 R2 +(1+eps)² 余量(原全 flood)。换 k 只换 radj,图不动。
+    // Reverse-kNN range traversal. A greedy beam reaches the query
+    // neighborhood, then bounded flooding collects points inside the target
+    // envelope. eps permits bridge points just outside that envelope.
+    // With adaptive flooding, radj supplies each object's target-rank lifted
+    // threshold. For targets within the graph horizon radj is non-positive;
+    // analytic extrapolation to a larger rank makes it positive. Exploration
+    // leaves a beta bridge between the target and graph horizons. A null radj
+    // uses the global R2 * (1 + eps)^2 expansion.
     void range_search(float* q, double R2, float eps, size_t L_descent,
                       std::vector<uint32_t>& results, size_t& out_ndist,
                       QueryVisited& visited,
@@ -1840,7 +1817,7 @@ public:
             f.write((char*)lnk(i), d * 4);
         }
         save_tree(f);
-        return true;
+        return static_cast<bool>(f);
     }
 
     bool load_index() {
@@ -1848,13 +1825,33 @@ public:
         std::ifstream f(p, std::ios::binary);
         if (!f.good()) { std::cerr << "no cached index: " << p << "\n"; return false; }
         std::cout << "Loading index from: " << p << "\n";
-        size_t fn, fdim, fM; f.read((char*)&fn, sizeof(fn)); f.read((char*)&fdim, sizeof(fdim));
-        f.read((char*)&fM, sizeof(fM)); f.read((char*)&construction_time, sizeof(construction_time));
-        for (size_t i = 0; i < n; i++) {
-            uint32_t d; f.read((char*)&d, 4);
-            deg(i) = d; f.read((char*)lnk(i), d * 4);
+        size_t fn = 0, fdim = 0, fM = 0;
+        if (!f.read((char*)&fn, sizeof(fn)) || !f.read((char*)&fdim, sizeof(fdim)) ||
+            !f.read((char*)&fM, sizeof(fM)) ||
+            !f.read((char*)&construction_time, sizeof(construction_time)) ||
+            fn != n || fdim != dim || fM != M || !std::isfinite(construction_time)) {
+            std::cerr << "incompatible or truncated cached index: " << p << "\n";
+            return false;
         }
-        load_tree(f);
+        for (size_t i = 0; i < n; i++) {
+            uint32_t d = 0;
+            if (!f.read((char*)&d, 4) || d > M ||
+                !f.read((char*)lnk(i), d * 4)) {
+                std::cerr << "invalid adjacency data in cached index: " << p << "\n";
+                return false;
+            }
+            for (uint32_t j = 0; j < d; j++) {
+                if (lnk(i)[j] >= n) {
+                    std::cerr << "invalid neighbor id in cached index: " << p << "\n";
+                    return false;
+                }
+            }
+            deg(i) = d;
+        }
+        if (!load_tree(f)) {
+            std::cerr << "invalid RP tree in cached index: " << p << "\n";
+            return false;
+        }
         graph_entry_ = choose_vamana_entry();
         return true;
     }
@@ -1872,17 +1869,45 @@ public:
             f.write((char*)nd.indices.data(), is * sizeof(uint32_t));
         }
     }
-    void load_tree(std::ifstream& f) {
-        f.read((char*)&search_tree.leaf_size, sizeof(search_tree.leaf_size));
-        f.read((char*)&search_tree.n_leaves, sizeof(search_tree.n_leaves));
-        size_t ns; f.read((char*)&ns, sizeof(ns));
+    bool load_tree(std::ifstream& f) {
+        size_t leaf_size = 0, n_leaves = 0, ns = 0;
+        if (!f.read((char*)&leaf_size, sizeof(leaf_size)) ||
+            !f.read((char*)&n_leaves, sizeof(n_leaves)) ||
+            !f.read((char*)&ns, sizeof(ns)) || leaf_size == 0 || leaf_size > 1000000 ||
+            n_leaves == 0 || n_leaves > n || ns == 0 || ns > 2 * n) {
+            return false;
+        }
+        search_tree.leaf_size = leaf_size;
+        search_tree.n_leaves = n_leaves;
+        search_tree.nodes.clear();
+        search_tree.nodes.reserve(ns);
         for (size_t i = 0; i < ns; i++) {
             size_t left, right; float offset; std::vector<float> hp; std::vector<uint32_t> idx;
-            f.read((char*)&left, sizeof(left)); f.read((char*)&right, sizeof(right)); f.read((char*)&offset, sizeof(offset));
-            size_t hs; f.read((char*)&hs, sizeof(hs)); hp.resize(hs); f.read((char*)hp.data(), hs * sizeof(float));
-            size_t is; f.read((char*)&is, sizeof(is)); idx.resize(is); f.read((char*)idx.data(), is * sizeof(uint32_t));
+            if (!f.read((char*)&left, sizeof(left)) ||
+                !f.read((char*)&right, sizeof(right)) ||
+                !f.read((char*)&offset, sizeof(offset)) || !std::isfinite(offset)) {
+                return false;
+            }
+            size_t hs = 0;
+            if (!f.read((char*)&hs, sizeof(hs)) || hs > dim) return false;
+            hp.resize(hs);
+            if (!f.read((char*)hp.data(), hs * sizeof(float))) return false;
+            size_t is = 0;
+            if (!f.read((char*)&is, sizeof(is)) || is > n) return false;
+            idx.resize(is);
+            if (!f.read((char*)idx.data(), is * sizeof(uint32_t)) ||
+                std::any_of(idx.begin(), idx.end(), [this](uint32_t id) { return id >= n; })) {
+                return false;
+            }
+            const bool leaf = left == UINT32_MAX && right == UINT32_MAX;
+            const bool internal = left < i && right < i;
+            if ((!leaf && !internal) || (leaf && idx.empty()) ||
+                (internal && hs != dim)) {
+                return false;
+            }
             search_tree.nodes.emplace_back(rptnode(left, right, offset, hp, idx));
         }
+        return static_cast<bool>(f);
     }
 };
 

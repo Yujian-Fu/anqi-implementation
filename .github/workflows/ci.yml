@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependency
+        run: python -m pip install --disable-pip-version-check numpy
+      - name: Check scripts
+        run: |
+          bash -n scripts/*.sh
+          python -m compileall -q scripts tools
+      - name: Build C++ binaries
+        run: make -j2
+      - name: Check command-line validation
+        run: |
+          bin/rknn_query >/dev/null 2>&1 || test "$?" -eq 2
+          bin/dataset_gt >/dev/null 2>&1 || test "$?" -eq 2
+      - name: Run end-to-end sample when AVX-512 is available
+        run: |
+          if grep -qw avx512f /proc/cpuinfo; then
+            ./scripts/run_sample.sh
+          else
+            echo "Runner does not expose AVX-512; compile checks completed."
+          fi

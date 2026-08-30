@@ -1,18 +1,4 @@
-// =============================================================================
-//  dataset_gt.cpp —— 每数据集一次算齐：base-to-base kNN GT + reverse-kNN GT（tiled 加速）
-// -----------------------------------------------------------------------------
-//  ① base-to-base top-K kNN（每 base 点的精确 k 近邻）—— tiled 分块，base 向量留 cache，
-//     base 只读 n/TILE 遍而非 n 遍 → 从 O(n²) 内存带宽 bound 的几十分钟降到秒级。
-//     用途: (a) 提供 r_k²(o)=第 rk_k 近距离 给 rknn GT/lift；(b) 当 base AKNN 准确性判据。
-//  ② reverse-kNN GT: 用 r_k 做 membership（每 query 扫 base，δ²≤r_k(o)²）。
-//
-//  输出:
-//    <name>_baseknn_gt.bin : [n:u32][K:u32][n*K u32 ids][n*K f32 d²]  (base-to-base top-K, 排除自身, 升序)
-//    <name>_rknn_gt.bin     : [nq:u32][(nq+1) u32 off][total u32 ids][total f32 d²]  (CSR)
-//    <name>_rknn_gt.bin.rk  : [n:u32][k:u32][n f32 r_k²]
-//  编译: g++ -O3 -mavx512f -march=native -fopenmp -std=c++17 -I ../include dataset_gt.cpp -o dataset_gt
-//  用法: ./dataset_gt --base B.bin --query Q.bin --K 100 --rk_k 10 --out_prefix /path/NAME [--tile 512]
-// =============================================================================
+// Exact base-to-base top-K and reverse-kNN ground-truth generator.
 #include "../include/distance.h"
 #include <vector>
 #include <queue>
@@ -21,32 +7,124 @@
 #include <string>
 #include <iostream>
 #include <cstdlib>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <limits>
 #include <omp.h>
-#include <sys/resource.h>
 #include <immintrin.h>
 
 static float* load_fbin(const std::string& p, size_t& n, size_t& d) {
-    std::ifstream f(p, std::ios::binary); if(!f){std::cerr<<"open "<<p<<"\n";exit(1);}
-    uint32_t nn,dd; f.read((char*)&nn,4); f.read((char*)&dd,4); n=nn; d=dd;
-    float* x=static_cast<float*>(_mm_malloc((size_t)n*d*4,64)); f.read((char*)x,(size_t)n*d*4); return x;
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::cerr << "[dgt] cannot open " << p << "\n";
+        std::exit(3);
+    }
+    const std::streamoff bytes = f.tellg();
+    f.seekg(0);
+    uint32_t nn = 0, dd = 0;
+    if (bytes < 8 || !f.read(reinterpret_cast<char*>(&nn), 4) ||
+        !f.read(reinterpret_cast<char*>(&dd), 4) || nn == 0 || dd == 0) {
+        std::cerr << "[dgt] invalid fbin header: " << p << "\n";
+        std::exit(3);
+    }
+    const uint64_t values = static_cast<uint64_t>(nn) * dd;
+    const uint64_t expected = 8 + values * sizeof(float);
+    if (expected != static_cast<uint64_t>(bytes) ||
+        values > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        std::cerr << "[dgt] invalid fbin size: " << p << "\n";
+        std::exit(3);
+    }
+    n = nn;
+    d = dd;
+    float* x = static_cast<float*>(_mm_malloc(values * sizeof(float), 64));
+    if (!x || !f.read(reinterpret_cast<char*>(x), values * sizeof(float))) {
+        std::cerr << "[dgt] cannot read fbin values: " << p << "\n";
+        _mm_free(x);
+        std::exit(3);
+    }
+    return x;
 }
-static double peak_gb(){ struct rusage r; getrusage(RUSAGE_SELF,&r); return r.ru_maxrss/1e6; }
+
+static size_t parse_positive_size(const char* text, const char* name) {
+    if (!text || !*text) {
+        std::cerr << "[dgt] missing value for " << name << "\n";
+        std::exit(2);
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || value == 0 ||
+        value > std::numeric_limits<size_t>::max()) {
+        std::cerr << "[dgt] invalid " << name << "=" << text << "\n";
+        std::exit(2);
+    }
+    return static_cast<size_t>(value);
+}
+
+static void require_write(const std::ofstream& stream, const std::string& path) {
+    if (!stream) {
+        std::cerr << "[dgt] failed to write " << path << "\n";
+        std::exit(3);
+    }
+}
 
 int main(int argc, char** argv) {
     std::string base_p, query_p, prefix, metric="l2"; size_t K=100, rk_k=10, TILE=512, nthreads=0;
-    for (int i=1;i<argc;i++){ std::string a=argv[i];
-        if(a=="--base")base_p=argv[++i]; else if(a=="--query")query_p=argv[++i];
-        else if(a=="--K")K=atoi(argv[++i]); else if(a=="--rk_k")rk_k=atoi(argv[++i]);
-        else if(a=="--out_prefix")prefix=argv[++i]; else if(a=="--tile")TILE=atoi(argv[++i]);
-        else if(a=="--metric")metric=argv[++i]; else if(a=="--threads")nthreads=atoi(argv[++i]); }
+    auto next_value = [&](int& i, const std::string& option) -> const char* {
+        if (i + 1 >= argc) {
+            std::cerr << "[dgt] missing value for " << option << "\n";
+            std::exit(2);
+        }
+        return argv[++i];
+    };
+    for (int i = 1; i < argc; i++) {
+        const std::string a = argv[i];
+        if (a == "--base") base_p = next_value(i, a);
+        else if (a == "--query") query_p = next_value(i, a);
+        else if (a == "--K") K = parse_positive_size(next_value(i, a), "K");
+        else if (a == "--rk_k") rk_k = parse_positive_size(next_value(i, a), "rk_k");
+        else if (a == "--out_prefix") prefix = next_value(i, a);
+        else if (a == "--tile") TILE = parse_positive_size(next_value(i, a), "tile");
+        else if (a == "--metric") metric = next_value(i, a);
+        else if (a == "--threads") nthreads = parse_positive_size(next_value(i, a), "threads");
+        else {
+            std::cerr << "[dgt] unknown option: " << a << "\n";
+            return 2;
+        }
+    }
+    if (base_p.empty() || query_p.empty() || prefix.empty()) {
+        std::cerr << "usage: " << argv[0]
+                  << " --base BASE.bin --query QUERY.bin --out_prefix PREFIX"
+                  << " [--K 100] [--rk_k 10] [--tile 512] [--metric l2|ip]"
+                  << " [--threads N]\n";
+        return 2;
+    }
+    if (metric != "l2" && metric != "ip") {
+        std::cerr << "[dgt] metric must be l2 or ip\n";
+        return 2;
+    }
+    if (nthreads > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        std::cerr << "[dgt] thread count is too large\n";
+        return 2;
+    }
     bool is_ip = (metric=="ip");
-    // 统一 key：小 key=更优。L2: key=d²(越小越近)。IP: key=−⟨a,b⟩(越小内积越大)。
-    // 存的 rk2[] = 第 rk_k 个的 key（L2 即 r_k²；IP 即 −ip_k）。membership 统一: key(q,o) ≤ rk2[o]。
     if(nthreads) omp_set_num_threads((int)nthreads);
     int T=omp_get_max_threads(); auto t_all=std::chrono::steady_clock::now();
 
     size_t n,D,nq,dq; float* base=load_fbin(base_p,n,D); float* query=load_fbin(query_p,nq,dq);
+    if (D != dq) {
+        std::cerr << "[dgt] base/query dimension mismatch: " << D << " != " << dq << "\n";
+        _mm_free(base);
+        _mm_free(query);
+        return 3;
+    }
+    if (K >= n || rk_k > K) {
+        std::cerr << "[dgt] require rk_k <= K < base vector count\n";
+        _mm_free(base);
+        _mm_free(query);
+        return 2;
+    }
     std::cout<<"[dgt] n="<<n<<" nq="<<nq<<" D="<<D<<" K="<<K<<" rk_k="<<rk_k<<" tile="<<TILE<<" threads="<<T<<"\n";
     auto item=[&](float*p,size_t i){return p+i*D;};
     std::vector<float> bnorm(n),qnorm(nq);
@@ -55,7 +133,7 @@ int main(int argc, char** argv) {
     #pragma omp parallel for
     for(size_t q=0;q<nq;q++) qnorm[q]=DistCal::InnerProductSIMD16ExtAVX512_(item(query,q),item(query,q),D);
 
-    // ---- ① tiled base-to-base top-K ----
+    // Exact tiled base-to-base top-K with self exclusion.
     std::vector<uint32_t> knn_ids((size_t)n*K); std::vector<float> knn_d((size_t)n*K);
     std::vector<float> rk2(n);
     auto t1=std::chrono::steady_clock::now();
@@ -64,8 +142,8 @@ int main(int argc, char** argv) {
     for(size_t t=0;t<ntile;t++){
         size_t ts=t*TILE, te=std::min(n,ts+TILE);
         size_t tn=te-ts;
-        // 每个 tile 点维护一个容量 K 的大顶堆。显式跳过自身，避免
-        // 浮点并列或重复向量使 self-match 不在排序首位时被错误保留。
+        // Each row maintains a size-K max heap. Self matches are skipped
+        // explicitly so ties and duplicate vectors do not retain the diagonal.
         std::vector<std::priority_queue<std::pair<float,uint32_t>>> heaps(tn);
         for(size_t j=0;j<n;j++){
             const float* bj=item(base,j); float nj=bnorm[j];
@@ -73,7 +151,7 @@ int main(int argc, char** argv) {
                 size_t ti=ts+a;
                 if(j==ti) continue;
                 float ip=DistCal::InnerProductSIMD16ExtAVX512_(item(base,ti),bj,D);
-                float key = is_ip ? (-ip) : (bnorm[ti]+nj-2.0f*ip);   // 统一 key：小=优
+                float key = is_ip ? (-ip) : (bnorm[ti]+nj-2.0f*ip);
                 auto& h=heaps[a];
                 if(h.size()<K) h.emplace(key,(uint32_t)j);
                 else if(key<h.top().first){ h.pop(); h.emplace(key,(uint32_t)j); }
@@ -83,7 +161,7 @@ int main(int argc, char** argv) {
             size_t ti=ts+a; auto& h=heaps[a];
             std::vector<std::pair<float,uint32_t>> v; v.reserve(h.size());
             while(!h.empty()){ v.push_back(h.top()); h.pop(); }
-            std::sort(v.begin(),v.end());                 // 升序
+            std::sort(v.begin(),v.end());
             if(v.size()!=K){
                 #pragma omp critical
                 std::cerr<<"[dgt] insufficient non-self neighbors row="<<ti
@@ -91,13 +169,13 @@ int main(int argc, char** argv) {
                 std::abort();
             }
             for(size_t r=0;r<K;r++){ knn_ids[ti*K+r]=v[r].second; knn_d[ti*K+r]=v[r].first; }
-            rk2[ti]=knn_d[ti*K+(rk_k-1)];                 // 第 rk_k 近(排除自身) = r_k²
+            rk2[ti]=knn_d[ti*K+(rk_k-1)];
         }
     }
-    std::cout<<"[dgt] ① base-to-base top-K done in "
+    std::cout<<"[dgt] base-to-base top-K done in "
              <<std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t1).count()/1000.0<<"s\n";
 
-    // ---- ② rknn GT: membership ----
+    // Exact reverse-kNN membership using each object's rank-k threshold.
     std::vector<std::vector<uint32_t>> rids(nq); std::vector<std::vector<float>> rdst(nq);
     auto t2=std::chrono::steady_clock::now();
     #pragma omp parallel for schedule(dynamic,64)
@@ -107,30 +185,39 @@ int main(int argc, char** argv) {
         for(size_t j=0;j<n;j++){
             float ip=DistCal::InnerProductSIMD16ExtAVX512_(qv,item(base,j),D);
             float key = is_ip ? (-ip) : (qn+bnorm[j]-2.0f*ip);
-            if(key<=rk2[j]) hits.emplace_back(key,(uint32_t)j);   // key(q,o) ≤ rk2[o] 统一 membership
+            if(key<=rk2[j]) hits.emplace_back(key,(uint32_t)j);
         }
         std::sort(hits.begin(),hits.end());
         for(auto&h:hits){ rids[q].push_back(h.second); rdst[q].push_back(h.first); }
     }
-    std::cout<<"[dgt] ② rknn membership done in "
+    std::cout<<"[dgt] reverse-kNN membership done in "
              <<std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t2).count()/1000.0<<"s\n";
 
-    // ---- 写文件 ----
-    { std::ofstream f(prefix+"_baseknn_gt.bin",std::ios::binary); uint32_t un=n,uk=K;
+    { const std::string path = prefix+"_baseknn_gt.bin"; std::ofstream f(path,std::ios::binary); uint32_t un=n,uk=K;
       f.write((char*)&un,4); f.write((char*)&uk,4);
       f.write((char*)knn_ids.data(),(size_t)n*K*4); f.write((char*)knn_d.data(),(size_t)n*K*4);
-      std::cout<<"[dgt] wrote "<<prefix<<"_baseknn_gt.bin (n×K = "<<n<<"×"<<K<<")\n"; }
-    { std::ofstream f(prefix+"_rknn_gt.bin",std::ios::binary); uint32_t unq=nq;
+      require_write(f, path);
+      std::cout<<"[dgt] wrote "<<path<<" (n*K = "<<n<<"*"<<K<<")\n"; }
+    { const std::string path = prefix+"_rknn_gt.bin"; std::ofstream f(path,std::ios::binary); uint32_t unq=nq;
+      uint64_t total = 0; for (const auto& ids : rids) total += ids.size();
+      if (total > std::numeric_limits<uint32_t>::max()) {
+          std::cerr << "[dgt] reverse-kNN output exceeds uint32 CSR capacity\n";
+          return 3;
+      }
       std::vector<uint32_t> off(nq+1,0); for(size_t q=0;q<nq;q++) off[q+1]=off[q]+(uint32_t)rids[q].size();
       f.write((char*)&unq,4); f.write((char*)off.data(),(nq+1)*4);
       for(size_t q=0;q<nq;q++) f.write((char*)rids[q].data(),rids[q].size()*4);
       for(size_t q=0;q<nq;q++) f.write((char*)rdst[q].data(),rdst[q].size()*4);
-      std::cout<<"[dgt] wrote "<<prefix<<"_rknn_gt.bin (total_pairs="<<off[nq]<<", mean |R|="<<(double)off[nq]/nq<<")\n"; }
-    { std::ofstream f(prefix+"_rknn_gt.bin.rk",std::ios::binary); uint32_t un=n,uk=rk_k;
+      require_write(f, path);
+      std::cout<<"[dgt] wrote "<<path<<" (total_pairs="<<off[nq]<<", mean |R|="<<(double)off[nq]/nq<<")\n"; }
+    { const std::string path = prefix+"_rknn_gt.bin.rk"; std::ofstream f(path,std::ios::binary); uint32_t un=n,uk=rk_k;
       f.write((char*)&un,4); f.write((char*)&uk,4); f.write((char*)rk2.data(),(size_t)n*4);
-      std::cout<<"[dgt] wrote "<<prefix<<"_rknn_gt.bin.rk (r_k² array)\n"; }
+      require_write(f, path);
+      std::cout<<"[dgt] wrote "<<path<<" (rank-k threshold array)\n"; }
 
     double secs=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t_all).count()/1000.0;
-    std::cout<<"[dgt] === SUMMARY === threads="<<T<<" | total_time="<<secs<<"s | peak_mem="<<peak_gb()<<" GB\n";
+    std::cout<<"[dgt] summary threads="<<T<<" total_time="<<secs<<"s\n";
+    _mm_free(base);
+    _mm_free(query);
     return 0;
 }
