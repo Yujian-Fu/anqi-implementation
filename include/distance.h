@@ -2,6 +2,7 @@
 // AVX-512 distance kernels used by graph construction and search.
 
 #include <vector>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 #include <string>
@@ -18,7 +19,8 @@ const float EPS = 1e-6;
 
 // 命名空间自由函数版内积（RP 树构造时算超平面/投影 margin 用，见 rptrees.h）。
 // 带尾部 mask 处理 dim 余数，使用非对齐 load。
-static float InnerProductSIMD16ExtAVX512_(const float* pVect1, const float* pVect2, uint32_t dim) {
+[[maybe_unused]] static float InnerProductSIMD16ExtAVX512_(
+    const float* pVect1, const float* pVect2, uint32_t dim) {
     size_t qty16 = dim / 16;
     size_t remainder = dim % 16;
     const float* pEnd1 = pVect1 + (qty16 * 16);

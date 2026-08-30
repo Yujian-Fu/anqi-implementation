@@ -496,7 +496,7 @@ public:
         return ball_occludes_distance(base, sid, dbase_cid, d2(sid, cid));
     }
 
-    void ball_sort_candidates(size_t base, const std::vector<std::pair<float,uint32_t>>& cand,
+    void ball_sort_candidates(size_t, const std::vector<std::pair<float,uint32_t>>& cand,
                               std::vector<std::pair<float,uint32_t>>& sorted) const {
         sorted = cand;
         if (!edge_ball_rng_) return;
@@ -867,7 +867,8 @@ public:
             uint32_t dg = deg(cur); uint32_t* L = lnk(cur);
             for (uint32_t j = 0; j < dg; j++) {
                 uint32_t nb = L[j];
-                if (vmark[nb] == vver) continue; vmark[nb] = vver;
+                if (vmark[nb] == vver) continue;
+                vmark[nb] = vver;
                 float d = d2(i, nb); beam.insert(Neighbor(nb, d)); if (nb != (uint32_t)i) pool.emplace_back(d, nb);
             }
         }
@@ -1497,7 +1498,8 @@ public:
         for (size_t j = 0; j < g0->indices[i].size(); j++) {
             uint32_t id = g0->indices[i][j];
             if (id == UINT32_MAX || id >= n) continue;
-            if (vmark[id] == vver) continue; vmark[id] = vver;
+            if (vmark[id] == vver) continue;
+            vmark[id] = vver;
             float d = g0->values[i][j];
             cand.insert(Neighbor(id, d)); push(id, d);
         }
@@ -1505,14 +1507,16 @@ public:
             uint32_t cur = cand.closest_unexpanded().id();
             for (uint32_t nb : g0->indices[cur]) {
                 if (nb == UINT32_MAX || nb >= n) continue;
-                if (vmark[nb] == vver) continue; vmark[nb] = vver;
+                if (vmark[nb] == vver) continue;
+                vmark[nb] = vver;
                 float d = d2(i, nb);
                 cand.insert(Neighbor(nb, d)); push(nb, d);
             }
             // 也探一部分反向边，提升候选多样性
             for (uint32_t nb : g0->reverse_indices[cur]) {
                 if (nb == UINT32_MAX || nb >= n) continue;
-                if (vmark[nb] == vver) continue; vmark[nb] = vver;
+                if (vmark[nb] == vver) continue;
+                vmark[nb] = vver;
                 float d = d2(i, nb);
                 cand.insert(Neighbor(nb, d)); push(nb, d);
             }

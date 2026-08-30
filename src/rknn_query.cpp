@@ -1472,7 +1472,8 @@ static void apply_radius_mode(
                 if (span <= 0) continue;
                 double raw_q = ((double)row[k] - (double)mn[k]) * 65535.0 / span;
                 double q = conservative ? std::floor(raw_q) : std::round(raw_q);
-                if (q < 0) q = 0; if (q > 65535) q = 65535;
+                if (q < 0) q = 0;
+                if (q > 65535) q = 65535;
                 row[k] = (float)((double)mn[k] + q * span / 65535.0);
             }
         }
