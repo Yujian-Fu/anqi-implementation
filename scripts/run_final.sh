@@ -49,8 +49,8 @@ export ANQI_RQ_OBJECTIVE=radius_reconstruction
 export ANQI_ALPHA=1.2
 export ANQI_LIFTNNK=50
 export ANQI_GRAPHNND=6
-export ANQI_GRAPH_CACHE_DIR="${RUN_ROOT}/graph/graph"
-export ANQI_VERIFIER_CACHE_DIR="${RUN_ROOT}/verifier/verifier"
+export ANQI_GRAPH_CACHE_DIR="${RUN_ROOT}/graph"
+export ANQI_VERIFIER_CACHE_DIR="${RUN_ROOT}/verifier"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-64}"
 
 if [[ "${ANQI_BENCH_CALIBRATED_TIMING:-1}" == 1 ]]; then
