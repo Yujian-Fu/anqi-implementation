@@ -2097,7 +2097,7 @@ int main(int argc, char** argv) {
             : (postfilter_analytic ? analytic_rankm.persistent_bytes()
                                    : conceptual_bytes_for_radius_mode(radius_mode, n, NK));
         radius_mode_desc = postfilter_verifier ? radius_key + ":postfilter" : radius_key;
-        printf("[rknn] LOAD 已存索引 (M=%zu): 跳过 kNN+lift+build, M*^2=%.6g scale=%.4g radius=%s\n",
+        printf("[rknn] loaded cached index (M=%zu): M*^2=%.6g scale=%.4g radius=%s\n",
                Marg, Mstar2, scale, radius_mode_desc.c_str());
     } else {
         // Build the original-space AKNN warm start, thresholds, and lift.
@@ -2156,7 +2156,7 @@ int main(int argc, char** argv) {
         original_knn_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - original_knn_t0).count();
         const auto graph_prepare_t0 = std::chrono::steady_clock::now();
-        printf("[rknn] 原始 kNN 准备好(复用为图 init), rows=%zu source=%s\n",
+        printf("[rknn] original-space AKNN warm start ready: rows=%zu source=%s\n",
                !nbr_orig_stream_ready && !compact_prebuilt_ids
                    ? (nbr_orig_flat.empty() ? nbr_orig.size() : n)
                    : n,
@@ -2299,7 +2299,7 @@ int main(int argc, char** argv) {
                (double)n * d * sizeof(float) / 1e9);
     }
 
-    printf("[rknn] 图度数 M=%zu\n", Marg);
+    printf("[rknn] graph degree M=%zu\n", Marg);
     nndindex index(graph_vector_file, par);
     const auto graph_index_t0 = std::chrono::steady_clock::now();
     if (can_load) index.build_index(false, false);                          // 载已存图
@@ -2527,7 +2527,7 @@ int main(int argc, char** argv) {
         R2_rankm = is_ip ? (Mstar2 + sg + 2.0*sc2q*mu_eff)
                          : (Mstar2 + 1.0 + sc2q*mu_eff + sg);
         radjp = nullptr;   // rank-M:membership 折进几何,不用 radj
-        printf("[rknn] rank-M query: metric=%s Kq=%zu slack=%.6g factor=%.6g R²(k)%s=%.6g (无 radj; recheck=%d)\n",
+        printf("[rknn] rank-M query: metric=%s Kq=%zu slack=%.6g factor=%.6g R2(k)%s=%.6g (radj=off recheck=%d)\n",
                metric.c_str(), Kq, rankm_slack, slack_factor, is_ip?"_base(+qn2s)":"", R2_rankm, RECHECK);
     }
     std::vector<float> exact_recheck_radii;

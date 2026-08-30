@@ -1234,7 +1234,7 @@ public:
             for (size_t i = 0; i < n; i++)
                 for (uint32_t j : (*init_nbr)[i])
                     if (j != (uint32_t)i && j < n) g0->push_nolock(i, j, d2(i, j));
-            rec.print_performance("init: 原始 kNN warm-start (重算 lifted d2)");
+            rec.print_performance("initialize lifted AKNN warm start");
             if (!std::getenv("ANQI_REUSE_ORIG_KNN"))
                 nndescent_refine(g0, rec, 6);     // Refine using lifted-space distances.
         } else {
@@ -1299,7 +1299,7 @@ public:
     //   不是只取 g0 原始(那是扩展前的 RP 森林,质量低)。这才是构图实际拿到的 kNN/半径。
     void build_approx_knn(std::vector<std::vector<uint32_t>>& nbr,
                           std::vector<std::vector<float>>& dist) {
-        performance_recorder rec("approx kNN (init + gather 扩展)");
+        performance_recorder rec("approximate kNN construction");
         float* cvec = static_cast<float*>(_mm_malloc(n * dim * sizeof(float), 64));
         #pragma omp parallel for num_threads(n_threads) schedule(static)
         for (size_t i = 0; i < n; i++) std::memcpy(cvec + i * dim, vec(i), dim * sizeof(float));
@@ -1343,7 +1343,7 @@ public:
                 std::sort(p.begin(),p.end());
                 for (auto&pr:p){ if(pr.second==(uint32_t)i)continue; nbr[i].push_back(pr.second); dist[i].push_back(pr.first); if(nbr[i].size()>=nn_k)break; }
             }
-            delete g0; rec.print_performance("skip-gather(用 g0)");
+            delete g0; rec.print_performance("use initial graph without gather");
         } else {
             g0->push_reverse(n_threads);
             size_t cand_cap = std::max<size_t>(nn_k, (size_t)(ef_alpha * explore_range));
@@ -1362,7 +1362,7 @@ public:
                 size_t d = ++_gdone;
                 if (d % _gstep == 0) fprintf(stderr, "  [gather] %3.0f%%\n", 100.0*d/n);
             }
-            delete g0; rec.print_performance("gather 扩展 → top-K");
+            delete g0; rec.print_performance("gather candidates and select top-K");
         }
     }
 
