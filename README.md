@@ -146,6 +146,12 @@ bin/dataset_gt --base DATA/base.bin --query DATA/query.bin \
 python3 tools/train_final_m8_u8.py --pfx DATA/run
 ```
 
+The trainer matches the reported verifier fit by default: a fixed 120,000-row
+PCA initialization, a seed-10 sample of the same size, three recursive
+basis/codebook rounds, and eight Lloyd iterations per codebook. It also extends
+the endpoint codewords to the full residual range so floor decoding remains
+one-sided outside the training sample.
+
 For the other query-k values, run `dataset_gt` with the same base/query and
 `--rk_k 10` or `--rk_k 50` on temporary prefixes, then install the resulting
 `_rknn_gt.bin` files as `run_rknn_gt_k10.bin` and `run_rknn_gt_k50.bin`.
