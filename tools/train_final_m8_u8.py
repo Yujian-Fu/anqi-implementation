@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import struct
+import time
 
 import numpy as np
 
@@ -26,9 +27,14 @@ MAGIC = b"ANQIRQ1\0"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train the recursive M8+u8 LRQ verifier from exact top-100 thresholds."
+        description="Train the recursive M8+u8 LRQ verifier from the AKNN cutoff matrix."
     )
     parser.add_argument("--pfx", required=True, type=Path, help="dataset prefix")
+    parser.add_argument(
+        "--threshold-source",
+        type=Path,
+        help="interleaved AKNN top-k records (default: <pfx>_baseknn_aknn.rec)",
+    )
     parser.add_argument("--train-sample", type=int, default=TRAIN_ROWS)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--recursive-iters", type=int, default=RECURSIVE_ITERS)
@@ -46,23 +52,30 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def read_threshold_matrix(path: Path) -> tuple[np.memmap, int]:
+def read_base_rows(path: Path) -> int:
     with path.open("rb") as stream:
         raw = stream.read(8)
     if len(raw) != 8:
-        raise RuntimeError(f"truncated baseknn header: {path}")
-    n, k = struct.unpack("<II", raw)
-    if k != K_MAX:
-        raise RuntimeError(f"expected K={K_MAX} in {path}, got K={k}")
+        raise RuntimeError(f"truncated base header: {path}")
+    n, d = struct.unpack("<II", raw)
+    if n == 0 or d == 0:
+        raise RuntimeError(f"invalid base header: {path}")
+    return n
+
+
+def read_threshold_matrix(path: Path, n: int) -> np.ndarray:
     if n < CODE_SIZE:
         raise RuntimeError(f"at least {CODE_SIZE} rows are required for u8 training, got {n}")
-
-    offset = 8 + n * k * 4
-    expected = offset + n * k * 4
+    expected = n * K_MAX * 8
     if path.stat().st_size != expected:
-        raise RuntimeError(f"bad baseknn size for {path}: {path.stat().st_size} != {expected}")
-    values = np.memmap(path, dtype="<f4", mode="r", offset=offset, shape=(n, k))
-    return values, n
+        raise RuntimeError(f"bad AKNN record size for {path}: {path.stat().st_size} != {expected}")
+    records = np.memmap(
+        path,
+        dtype=np.dtype([("id", "<u4"), ("key", "<f4")]),
+        mode="r",
+        shape=(n, K_MAX),
+    )
+    return records["key"]
 
 
 def fit_basis(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
@@ -175,9 +188,11 @@ def write_codebooks(path: Path, codebooks: np.ndarray) -> None:
 
 
 def main() -> int:
+    started = time.perf_counter()
     args = parse_args()
-    source = Path(f"{args.pfx}_baseknn_gt.bin")
-    thresholds, n = read_threshold_matrix(source)
+    source = args.threshold_source or Path(f"{args.pfx}_baseknn_aknn.rec")
+    n = read_base_rows(Path(f"{args.pfx}_base.bin"))
+    thresholds = read_threshold_matrix(source, n)
 
     sample_n = min(args.train_sample, n)
     seed_rows = np.asarray(thresholds[:sample_n], dtype=np.float64)
@@ -227,10 +242,24 @@ def main() -> int:
     if codebook_path.stat().st_size != expected_codebook_bytes:
         raise RuntimeError(f"bad codebook output size: {codebook_path}")
 
+    elapsed = time.perf_counter() - started
+    timing_path = Path(f"{args.pfx}_verifier_train_time.meta")
+    timing_path.write_text(
+        "ANQI_VERIFIER_TRAIN_V1\n"
+        f"seconds {elapsed:.17g}\n"
+        f"n {n}\n"
+        f"k {K_MAX}\n"
+        f"rank_m {RANK_M}\n"
+        f"bits {BITS}\n",
+        encoding="utf-8",
+    )
+
     print(
         f"[verifier-train] n={n} sample={sample_n} seed={args.seed} "
         f"rank_m={RANK_M} bits={BITS} rounds={args.recursive_iters} "
-        f"basis={basis_path} codebook={codebook_path}",
+        f"source={source} "
+        f"basis={basis_path} codebook={codebook_path} "
+        f"VERIFIER_TRAIN_TIME={elapsed:.6f}s",
         flush=True,
     )
     return 0

@@ -4,7 +4,7 @@ LDFLAGS ?=
 
 BIN_DIR := bin
 HEADERS := $(wildcard include/*.h)
-TARGETS := $(BIN_DIR)/dataset_gt $(BIN_DIR)/rknn_query
+TARGETS := $(BIN_DIR)/build_aknn_source $(BIN_DIR)/dataset_gt $(BIN_DIR)/rknn_query
 
 .PHONY: all clean
 
@@ -15,6 +15,9 @@ $(BIN_DIR):
 
 $(BIN_DIR)/dataset_gt: tools/dataset_gt.cpp $(HEADERS) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) tools/dataset_gt.cpp -o $@ $(LDFLAGS)
+
+$(BIN_DIR)/build_aknn_source: tools/build_aknn_source.cpp $(HEADERS) | $(BIN_DIR)
+	$(CXX) $(CXXFLAGS) tools/build_aknn_source.cpp -o $@ $(LDFLAGS)
 
 $(BIN_DIR)/rknn_query: src/rknn_query.cpp $(HEADERS) | $(BIN_DIR)
 	$(CXX) $(CXXFLAGS) src/rknn_query.cpp -o $@ $(LDFLAGS)

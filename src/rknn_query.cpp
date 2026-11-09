@@ -676,10 +676,10 @@ struct CompactLrqVerifier {
         }
     }
 
-    void build(const std::vector<float>& exact_radii) {
-        if (exact_radii.size() != n * nk) {
-            fprintf(stderr, "[rknn] LRQ build exact-radii size mismatch: got=%zu expected=%zu\n",
-                    exact_radii.size(), n * nk);
+    void build(const std::vector<float>& source_thresholds) {
+        if (source_thresholds.size() != n * nk) {
+            fprintf(stderr, "[rknn] LRQ source size mismatch: got=%zu expected=%zu\n",
+                    source_thresholds.size(), n * nk);
             exit(3);
         }
         coeff.assign(n * (size_t)rankm, 0.0f);
@@ -694,7 +694,7 @@ struct CompactLrqVerifier {
         }
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; i++) {
-            const float* rk = &exact_radii[i * nk];
+            const float* rk = &source_thresholds[i * nk];
             float* ci = &coeff[i * (size_t)rankm];
             for (int m = 0; m < rankm; m++) {
                 const float* gm = &basis[(size_t)m * nk];
@@ -1056,9 +1056,9 @@ static void compact_prebuilt_topk_ids_in_place(
            path.c_str(), source_k, width, compact_bytes / 1e9);
 }
 
-static std::string exact_radius_source_identity(const std::string& pfx) {
+static std::string threshold_source_identity(const std::string& pfx) {
     const std::string topk = prebuilt_topk_path();
-    return topk.empty() ? file_stat_identity(pfx + "_baseknn_gt.bin")
+    return topk.empty() ? file_stat_identity(pfx + "_baseknn_aknn.bin")
                         : file_stat_identity(topk) + ":interleaved_k" +
                               std::to_string(prebuilt_topk_width(100));
 }
@@ -1098,7 +1098,7 @@ static std::vector<uint32_t> load_prebuilt_knn_ids(
     return ids;
 }
 
-static void load_exact_radii_table(
+static void load_threshold_table(
     const std::string& pfx,
     size_t n,
     size_t NK,
@@ -1128,18 +1128,18 @@ static void load_exact_radii_table(
                 for (size_t k = 0; k < NK; k++) output[k] = row[k].distance;
             }
         }
-        printf("[rknn] loaded exact radii from interleaved top-k %s (n=%zu K=%zu)\n",
+        printf("[rknn] loaded AKNN cutoffs from interleaved top-k %s (n=%zu K=%zu)\n",
                topk.c_str(), n, NK);
         return;
     }
-    std::string path = pfx + "_baseknn_gt.bin";
+    std::string path = pfx + "_baseknn_aknn.bin";
     std::ifstream gf(path, std::ios::binary);
-    if (!gf) { fprintf(stderr, "[rknn] missing exact radius table %s\n", path.c_str()); exit(3); }
+    if (!gf) { fprintf(stderr, "[rknn] missing threshold table %s\n", path.c_str()); exit(3); }
     uint32_t gn = 0, gk = 0;
     gf.read((char*)&gn, 4);
     gf.read((char*)&gk, 4);
     if ((size_t)gn != n || (size_t)gk < NK) {
-        fprintf(stderr, "[rknn] bad exact radius table %s: n=%u K=%u expected n=%zu K>=%zu\n",
+        fprintf(stderr, "[rknn] bad threshold table %s: n=%u K=%u expected n=%zu K>=%zu\n",
                 path.c_str(), gn, gk, n, NK);
         exit(3);
     }
@@ -1153,10 +1153,10 @@ static void load_exact_radii_table(
         // approximate nndindex distances built in this process.
         for (size_t k = 0; k < NK; k++) out[k] = row[k];
     }
-    printf("[rknn] loaded exact radius table %s (n=%zu K=%zu)\n", path.c_str(), n, NK);
+    printf("[rknn] loaded threshold table %s (n=%zu K=%zu)\n", path.c_str(), n, NK);
 }
 
-static void load_exact_radius_column(
+static void load_threshold_column(
     const std::string& pfx,
     size_t n,
     size_t k_one_based,
@@ -1184,18 +1184,18 @@ static void load_exact_radius_column(
             for (size_t local = 0; local < rows; local++)
                 out[row0 + local] = chunk[local * source_k + (k_one_based - 1)].distance;
         }
-        printf("[rknn] loaded exact radius column from interleaved top-k %s (n=%zu k=%zu)\n",
+        printf("[rknn] loaded AKNN cutoff column from interleaved top-k %s (n=%zu k=%zu)\n",
                topk.c_str(), n, k_one_based);
         return;
     }
-    std::string path = pfx + "_baseknn_gt.bin";
+    std::string path = pfx + "_baseknn_aknn.bin";
     std::ifstream gf(path, std::ios::binary);
-    if (!gf) { fprintf(stderr, "[rknn] missing exact radius table %s\n", path.c_str()); exit(3); }
+    if (!gf) { fprintf(stderr, "[rknn] missing threshold table %s\n", path.c_str()); exit(3); }
     uint32_t gn = 0, gk = 0;
     gf.read((char*)&gn, 4);
     gf.read((char*)&gk, 4);
     if ((size_t)gn != n || k_one_based < 1 || k_one_based > (size_t)gk) {
-        fprintf(stderr, "[rknn] bad exact radius column request %s: n=%u K=%u expected n=%zu k=%zu\n",
+        fprintf(stderr, "[rknn] bad threshold column request %s: n=%u K=%u expected n=%zu k=%zu\n",
                 path.c_str(), gn, gk, n, k_one_based);
         exit(3);
     }
@@ -1205,12 +1205,12 @@ static void load_exact_radius_column(
     for (size_t i = 0; i < n; i++) {
         gf.read((char*)row.data(), (std::streamsize)gk * 4);
         if (!gf) {
-            fprintf(stderr, "[rknn] truncated exact radius table %s at row=%zu\n", path.c_str(), i);
+            fprintf(stderr, "[rknn] truncated threshold table %s at row=%zu\n", path.c_str(), i);
             exit(3);
         }
         out[i] = row[k_one_based - 1];
     }
-    printf("[rknn] loaded exact radius column %s (n=%zu k=%zu)\n",
+    printf("[rknn] loaded threshold column %s (n=%zu k=%zu)\n",
            path.c_str(), n, k_one_based);
 }
 
@@ -1235,7 +1235,7 @@ static std::string radius_cache_key(const std::string& mode, size_t NK, const st
         }
         const std::string radius_source_id = std::getenv("ANQI_RADIUS_SOURCE_ID")
             ? env_or("ANQI_RADIUS_SOURCE_ID", "missing_radius_source_id")
-            : exact_radius_source_identity(pfx);
+            : threshold_source_identity(pfx);
         key += ":src" + hash_string16(radius_source_id);
         key += ":rqpred_v3";
         key += radius_relax_key();
@@ -1336,7 +1336,7 @@ static void apply_rankm_residual_mode(
         printf("[rknn] learned RQ codebook: path=%s policy=%s bits=%d code_size=%zu\n",
                cb_path.c_str(), policy.c_str(), bits, code_size);
         if (materialize_radii)
-            printf("[rknn] materialized rank-M+RQ radius table for Any-K Lift during LRQ decode\n");
+            printf("[rknn] materialized rank-M+RQ threshold table for shared Lift during LRQ decode\n");
         return;
     }
     const bool use_u8 = (mode == "rankm_resid_u8_floor" || mode == "rankm_resid_u8_bias");
@@ -1422,7 +1422,7 @@ static void apply_rankm_residual_mode(
     mode_desc = mode + ":M" + std::to_string(RANKM) + ":b" + std::to_string(resid_bias) +
                 ":obj" + objective + ":rqpred_v2";
     if (materialize_radii)
-        printf("[rknn] materialized rank-M+RQ radius table for Any-K Lift during residual decode\n");
+        printf("[rknn] materialized rank-M+RQ threshold table for shared Lift during residual decode\n");
 }
 
 static void apply_radius_mode(
@@ -1597,7 +1597,6 @@ int main(int argc, char** argv) {
     const std::string PFX(argv[2]);
     std::string lifted = PFX + "_lifted_base.bin";
     std::string meta_p = PFX + "_lifted.meta";
-    std::string rk_p   = PFX + "_rknn_gt.bin.rk";
     std::string gt_p   = PFX + "_rknn_gt.bin";
 
     // Metadata fields: Mstar^2, dimension, rank horizon, metric, and scale.
@@ -1651,7 +1650,7 @@ int main(int argc, char** argv) {
     size_t Kq = kk;
     if (argc > 7 && !parse_size(argv[7], "QUERY_K", Kq)) return 2;
     if (Kq < 1 || Kq > NK) {
-        fprintf(stderr, "[rknn] requested Kq=%zu is outside the Any-K horizon [1,%zu]\n", Kq, NK);
+        fprintf(stderr, "[rknn] requested Kq=%zu is outside the represented rank range [1,%zu]\n", Kq, NK);
         return 2;
     }
     {
@@ -1672,10 +1671,10 @@ int main(int argc, char** argv) {
             }
         }
     }
-    printf("[rknn] any-k: Kq=%zu NK=%zu graph_NK=%zu GT=%s\n",
+    printf("[rknn] shared-index query: Kq=%zu NK=%zu graph_NK=%zu GT=%s\n",
            Kq, NK, GRAPH_NK, gt_p.c_str());
 
-    // Original vectors are used by lifting and exact candidate verification.
+    // Original vectors are used by lifting and candidate verification.
     size_t n, d, nq, dq; float* base = load_base_vectors(PFX+"_base.bin", n, d);
     float* query = load_fbin(PFX+"_query.bin", nq, dq);
     if (d != d0 || dq != d0) {
@@ -1683,25 +1682,6 @@ int main(int argc, char** argv) {
                 "[rknn] vector dimension does not match lift metadata: "
                 "base=%zu query=%zu metadata=%zu\n",
                 d, dq, d0);
-        return 3;
-    }
-
-    // Load the rank-horizon threshold source.
-    std::ifstream rf(rk_p, std::ios::binary | std::ios::ate);
-    const std::streamoff rk_bytes = rf
-        ? static_cast<std::streamoff>(rf.tellg())
-        : static_cast<std::streamoff>(-1);
-    rf.seekg(0);
-    uint32_t rn = 0, rkk = 0;
-    if (!rf || rk_bytes != static_cast<std::streamoff>(8 + n * sizeof(float)) ||
-        !rf.read(reinterpret_cast<char*>(&rn), 4) ||
-        !rf.read(reinterpret_cast<char*>(&rkk), 4) || rn != n || rkk != kk) {
-        fprintf(stderr, "[rknn] invalid rank-threshold source: %s\n", rk_p.c_str());
-        return 3;
-    }
-    std::vector<float> rk2(n);
-    if (!rf.read(reinterpret_cast<char*>(rk2.data()), n * sizeof(float))) {
-        fprintf(stderr, "[rknn] truncated rank-threshold source: %s\n", rk_p.c_str());
         return 3;
     }
 
@@ -1804,7 +1784,7 @@ int main(int argc, char** argv) {
     const bool postfilter_verifier = postfilter_compact || postfilter_analytic || postfilter_exact;
     if (verifier_placement == "postfilter" && !postfilter_verifier) {
         fprintf(stderr,
-                "[rknn] postfilter verifier supports Any-K Lift or original geometry "
+                "[rknn] postfilter verifier supports construction-rank Lift or original geometry "
                 "with exact_f32, rankm_only, analytic_rankm, float32 residual, or learned LRQ; "
                 "got metric=%s geometry=%s radius_mode=%s\n",
                 metric.c_str(), graph_geometry.c_str(), radius_mode.c_str());
@@ -1848,11 +1828,11 @@ int main(int argc, char** argv) {
     if (candidate_uses_verifier &&
         (!postfilter_verifier || !graph_anyk_lift || is_ip)) {
         fprintf(stderr,
-                "[rknn] verifier candidate envelope currently requires L2 Any-K Lift "
+                "[rknn] verifier candidate envelope currently requires L2 construction-rank Lift "
                 "with an independent postfilter verifier\n");
         exit(2);
     }
-    bool exact_radius_mode = (radius_mode == "exact_f32" || radius_mode == "exact_fp16" ||
+    bool source_threshold_mode = (radius_mode == "exact_f32" || radius_mode == "exact_fp16" ||
                               radius_mode == "exact_u16" || radius_mode == "exact_u16_floor" ||
                               radius_mode == "knots" || is_rankm_residual_mode(radius_mode) ||
                               is_rankm_only_mode(radius_mode) || is_analytic_rankm_mode(radius_mode));
@@ -1864,12 +1844,12 @@ int main(int argc, char** argv) {
         env_or("ANQI_GRAPH_RADIUS_SOURCE_PFX", PFX.c_str());
     if (postfilter_verifier) {
         const std::string graph_radius_id = std::getenv("ANQI_GRAPH_RADIUS_ID")
-            ? env_or("ANQI_GRAPH_RADIUS_ID", "exact_r100_v1")
+            ? env_or("ANQI_GRAPH_RADIUS_ID", "aknn_k100_v1")
             : file_stat_identity(
                   base_vector_source(graph_radius_source + "_base.bin")) + "|" +
-              exact_radius_source_identity(graph_radius_source) +
+              threshold_source_identity(graph_radius_source) +
               ":k" + std::to_string(GRAPH_NK) + ":v2";
-        graph_key += "_graph_exact_r" + std::to_string(GRAPH_NK) + "_" +
+        graph_key += "_graph_cutoff_k" + std::to_string(GRAPH_NK) + "_" +
                      hash_string16(graph_radius_id);
     } else graph_key += "_rad" + hash_string16(radius_key);
     graph_key = sanitize_tag(graph_key);
@@ -1968,7 +1948,7 @@ int main(int argc, char** argv) {
 
     std::vector<float> rk2a_all;
     if (!postfilter_verifier) rk2a_all.resize((size_t)n * NK);
-    // Exact graph-only r_100 signal. Lift embeds it in d+2; original geometry
+    // Construction-rank AKNN cutoff. Lift embeds it in d+2; original geometry
     // keeps the same envelope as an external per-object sidecar.
     std::vector<float> graph_horizon_radius;
     std::vector<float> verification_thresholds;  // current-k threshold, independent of graph/search
@@ -1992,7 +1972,7 @@ int main(int argc, char** argv) {
         if (analytic_rankm.train_kmax != GRAPH_NK) {
             fprintf(stderr,
                     "[rknn] analytic Rank-M training horizon=%zu must match graph horizon=%zu "
-                    "for the controlled Any-K experiment\n",
+                    "for the controlled multi-rank experiment\n",
                     analytic_rankm.train_kmax, GRAPH_NK);
             exit(2);
         }
@@ -2047,16 +2027,16 @@ int main(int argc, char** argv) {
 
     auto ensure_compact_lrq = [&](bool keep_graph_horizon_radius) {
         if (!postfilter_compact || compact_lrq_ready) return;
-        std::vector<float> exact_radii((size_t)n * NK);
-        load_exact_radii_table(PFX, n, NK, is_ip, exact_radii);
+        std::vector<float> source_thresholds((size_t)n * NK);
+        load_threshold_table(PFX, n, NK, is_ip, source_thresholds);
         const auto encode_t0 = std::chrono::steady_clock::now();
-        compact_lrq.build(exact_radii);
+        compact_lrq.build(source_thresholds);
         compact_lrq.save(compact_lrq_file);
         verifier_encode_save_ms = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - encode_t0).count() / 1000.0;
         compact_lrq_ready = true;
         if (keep_graph_horizon_radius) {
-            load_exact_radius_column(
+            load_threshold_column(
                 graph_radius_source, n, GRAPH_NK, is_ip, graph_horizon_radius);
         }
         printf("[rknn] built independent compact verifier mode=%s bits=%d %s "
@@ -2068,7 +2048,7 @@ int main(int argc, char** argv) {
                verifier_encode_save_ms);
     };
 
-    double original_knn_s = 0.0;
+    double source_prepare_s = 0.0;
     double lift_verifier_prepare_s = 0.0;
     double graph_index_s = 0.0;
     if (can_load) {
@@ -2090,7 +2070,7 @@ int main(int argc, char** argv) {
         }
         ensure_compact_lrq(false);
         if ((graph_original || candidate_uses_verifier) && graph_horizon_radius.empty())
-            load_exact_radius_column(
+            load_threshold_column(
                 graph_radius_source, n, GRAPH_NK, is_ip, graph_horizon_radius);
         conceptual_radius_bytes = postfilter_compact
             ? compact_lrq.persistent_bytes()
@@ -2153,7 +2133,7 @@ int main(int argc, char** argv) {
             nndindex oindex(PFX+"_base.bin", po);
             oindex.build_approx_knn(nbr_orig, dist_orig);
         }
-        original_knn_s = std::chrono::duration<double>(
+        source_prepare_s = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - original_knn_t0).count();
         const auto graph_prepare_t0 = std::chrono::steady_clock::now();
         printf("[rknn] original-space AKNN warm start ready: rows=%zu source=%s\n",
@@ -2166,7 +2146,7 @@ int main(int argc, char** argv) {
         if (postfilter_verifier) {
             ensure_compact_lrq(true);
             if (graph_horizon_radius.empty())
-                load_exact_radius_column(
+                load_threshold_column(
                     graph_radius_source, n, GRAPH_NK, is_ip, graph_horizon_radius);
             conceptual_radius_bytes = postfilter_compact
                 ? compact_lrq.persistent_bytes()
@@ -2176,7 +2156,7 @@ int main(int argc, char** argv) {
         } else {
             // rk2a = 第 kk 个的 key。L2: r_k²=dist;IP: −ip_k = (1−⟨⟩)−1 = dist−1。
             for (size_t o=0;o<n;o++){ for(size_t j=0;j<NK;j++){ float v=(dist_orig[o].size()>j)?dist_orig[o][j]:(dist_orig[o].empty()?1e30f:dist_orig[o].back()); rk2a_all[(size_t)o*NK+j]= is_ip ? (v-1.0f) : v; } }
-            if (exact_radius_mode) load_exact_radii_table(PFX, n, NK, is_ip, rk2a_all);
+            if (source_threshold_mode) load_threshold_table(PFX, n, NK, is_ip, rk2a_all);
             if (is_rankm_residual_mode(radius_mode)) {
                 apply_rankm_residual_mode(radius_mode, PFX, rk2a_all, n, NK, RANKM, Gba, muba,
                                           graph_anyk_lift,
@@ -2212,11 +2192,11 @@ int main(int argc, char** argv) {
                radius_mode_desc.c_str(), conceptual_radius_bytes / 1e9);
         if (graph_original) {
             if (graph_horizon_radius.empty())
-                load_exact_radius_column(
+                load_threshold_column(
                     graph_radius_source, n, GRAPH_NK, is_ip, graph_horizon_radius);
             Mstar2 = 0.0;
             scale = 1.0;
-            printf("[rknn] BUILD original L2 graph (dim=%zu) with external exact-r%zu envelope; "
+            printf("[rknn] BUILD original L2 graph (dim=%zu) with external AKNN-k%zu envelope; "
                    "verifier=%s\n",
                    d, NK, radius_mode_desc.c_str());
         } else {
@@ -2224,7 +2204,7 @@ int main(int argc, char** argv) {
         #pragma omp parallel for reduction(+:sum_n2)
         for(size_t i=0;i<n;i++){const float*o=base+i*d; double s=0; for(size_t j=0;j<d;j++) s+=(double)o[j]*o[j]; sum_n2+=s;}
         double s_scale=1.0/std::sqrt(sum_n2/n+1e-12), sc2=s_scale*s_scale;
-        // Graph geometry is independent of verification: Any-K Lift uses only
+        // Graph geometry is independent of verification: the shared Lift uses only
         // the horizon radius r_NK in d+2 dimensions.
         uint32_t dl = GRAPH_RANKM>0 ? (uint32_t)(d+1+GRAPH_RANKM) : (uint32_t)(d+1);
         std::vector<float> hat((size_t)n*dl); double maxn2=0;
@@ -2265,7 +2245,7 @@ int main(int argc, char** argv) {
         { std::ofstream f(state_file); f << cache_state_key << "\n"; }
         if (!graph_original) {
             const std::string graph_radius_desc = postfilter_verifier
-                ? ("exact_r" + std::to_string(GRAPH_NK)) : "radius_mode table";
+                ? ("aknn_k" + std::to_string(GRAPH_NK)) : "threshold table";
             printf("[rknn] BUILD lift M*^2=%.6g scale=%.4g (graph radius=%s; verifier=%s)\n",
                    Mstar2, scale, graph_radius_desc.c_str(),
                    postfilter_verifier?radius_mode_desc.c_str():"integrated");
@@ -2341,6 +2321,22 @@ int main(int argc, char** argv) {
     }
     index.visualize_parameters();
     double build_s = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-tb0).count()/1000.0;
+    auto external_seconds = [](const char* name) {
+        const char* raw = std::getenv(name);
+        if (!raw || !*raw) return 0.0;
+        char* end = nullptr;
+        errno = 0;
+        const double value = std::strtod(raw, &end);
+        if (errno != 0 || end == raw || *end != '\0' ||
+            !std::isfinite(value) || value < 0.0) {
+            fprintf(stderr, "[rknn] invalid %s=%s\n", name, raw);
+            exit(2);
+        }
+        return value;
+    };
+    const double aknn_build_s = external_seconds("ANQI_AKNN_BUILD_SECONDS");
+    const double verifier_train_s = external_seconds("ANQI_VERIFIER_TRAIN_SECONDS");
+    const double end_to_end_build_s = aknn_build_s + verifier_train_s + build_s;
     // Legacy materialized verifier counts coefficients separately. The compact
     // postfilter artifact already includes coefficients, packed codes, basis, and codebook.
     size_t conceptual_coeff_bytes = (!postfilter_compact && graph_anyk_lift && is_rankm_residual_mode(radius_mode))
@@ -2350,17 +2346,34 @@ int main(int argc, char** argv) {
     double idx_gb = ((double)n*par.M*4 + (double)n*(double)par.dim*4 +
                      (double)conceptual_verification_bytes +
                      (double)conceptual_envelope_bytes)/1e9;
-    printf("[rknn] BUILD_TIME=%.1fs INDEX_SIZE=%.2fGB "
-           "(graph M=%zu + graph dim=%zu + verification=%.3fGB + envelope=%.3fGB)\n",
-           build_s, idx_gb, par.M, par.dim,
-           conceptual_verification_bytes / 1e9, conceptual_envelope_bytes / 1e9);
+    if (can_load) {
+        printf("[rknn] INDEX_LOAD_TIME=%.1fs INDEX_SIZE=%.2fGB "
+               "(graph M=%zu + graph dim=%zu + verification=%.3fGB + envelope=%.3fGB)\n",
+               build_s, idx_gb, par.M, par.dim,
+               conceptual_verification_bytes / 1e9, conceptual_envelope_bytes / 1e9);
+    } else {
+        printf("[rknn] BUILD_TIME=%.1fs INDEX_SIZE=%.2fGB "
+               "(aknn_source=%.1fs + verifier_training=%.1fs + index=%.1fs, "
+               "graph M=%zu + graph dim=%zu + verification=%.3fGB + envelope=%.3fGB)\n",
+               end_to_end_build_s, idx_gb, aknn_build_s, verifier_train_s, build_s,
+               par.M, par.dim, conceptual_verification_bytes / 1e9,
+               conceptual_envelope_bytes / 1e9);
+    }
     if (env_flag("ANQI_BUILD_BREAKDOWN")) {
-        printf("[rknn] BUILD_BREAKDOWN mode=%s original_knn_s=%.6f "
-               "lift_verifier_prepare_s=%.6f graph_index_s=%.6f total_s=%.6f "
-               "verifier_encode_save_ms=%.3f verifier_load_ms=%.3f\n",
-               can_load ? "load" : "build", original_knn_s,
-               lift_verifier_prepare_s, graph_index_s, build_s,
-               verifier_encode_save_ms, verifier_load_ms);
+        if (can_load) {
+            printf("[rknn] LOAD_BREAKDOWN index_load_s=%.6f "
+                   "verifier_load_ms=%.3f\n",
+                   build_s, verifier_load_ms);
+        } else {
+            printf("[rknn] BUILD_BREAKDOWN aknn_source_s=%.6f "
+                   "verifier_train_s=%.6f source_prepare_s=%.6f "
+                   "lift_verifier_prepare_s=%.6f graph_index_s=%.6f "
+                   "index_total_s=%.6f end_to_end_s=%.6f "
+                   "verifier_encode_save_ms=%.3f\n",
+                   aknn_build_s, verifier_train_s, source_prepare_s,
+                   lift_verifier_prepare_s, graph_index_s, build_s,
+                   end_to_end_build_s, verifier_encode_save_ms);
+        }
     }
 
     // L2 adaptive flooding uses radj[o] = scale^2 * (r_Kq^2 - r_graph^2).
@@ -2426,7 +2439,7 @@ int main(int argc, char** argv) {
             std::chrono::steady_clock::now() - materialize_t0).count() / 1000.0;
     } else if (postfilter_exact) {
         const auto materialize_t0 = std::chrono::steady_clock::now();
-        load_exact_radius_column(PFX, n, Kq, is_ip, verification_thresholds);
+        load_threshold_column(PFX, n, Kq, is_ip, verification_thresholds);
         verifier_materialize_ms = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - materialize_t0).count() / 1000.0;
     }
@@ -2447,7 +2460,7 @@ int main(int argc, char** argv) {
     bool fixed_k_lift = (graph_anyk_lift && std::getenv("ANQI_SPECIFIC"));
     if (graph_original) {
         if (graph_horizon_radius.size() != n) {
-            fprintf(stderr, "[rknn] original geometry missing exact-r%zu envelope: got %zu expected %zu\n",
+            fprintf(stderr, "[rknn] original geometry missing AKNN-k%zu envelope: got %zu expected %zu\n",
                     GRAPH_NK, graph_horizon_radius.size(), n);
             exit(3);
         }
@@ -2489,7 +2502,7 @@ int main(int argc, char** argv) {
                                       (double)rk2a_all[o*NK+(NK-1)]));
         radjp=radj.data(); }
     if (graph_original) {
-        printf("[rknn] candidate generator: original L2 graph, external exact-r%zu envelope, "
+        printf("[rknn] candidate generator: original L2 graph, external AKNN-k%zu envelope, "
                "center graph search, beta=0; verifier is post-filter only\n", GRAPH_NK);
     } else {
         printf("[rknn] k-adaptive flood: Kq=%zu radj=%s beta=%.2f%s%s\n",
@@ -2499,12 +2512,12 @@ int main(int argc, char** argv) {
     if (postfilter_verifier && graph_anyk_lift) {
         if (candidate_uses_verifier) {
             printf("[rknn] candidate generator: modeled per-object target-k envelope on "
-                   "exact-r%zu Lift graph, center graph search; verifier=%s\n",
+                   "AKNN-k%zu Lift graph, center graph search; verifier=%s\n",
                    GRAPH_NK, postfilter_analytic ? "analytic-rank-M" :
                    (postfilter_lrq ? "rank-M+LRQ" :
                     (postfilter_rankm ? "rank-M-only" : "exact_f32")));
         } else {
-            printf("[rknn] candidate generator: exact-r%zu envelope, center graph search; "
+            printf("[rknn] candidate generator: AKNN-k%zu envelope, center graph search; "
                    "verifier is post-filter only\n", GRAPH_NK);
         }
     }
@@ -2514,7 +2527,7 @@ int main(int argc, char** argv) {
         printf("[rknn] search score: mode=%s lambda=%s\n", ss.c_str(), sl.c_str());
     }
     auto item = [&](size_t i){ return base + i*d; };
-    // rank-M 图才扩展 query 维度；Any-K Lift 始终使用共享的 d+2 query。
+    // Rank-M graph geometry extends the query; shared Lift uses one d+2 query.
     uint32_t LD = graph_original
         ? (uint32_t)d
         : (uint32_t)(d + (GRAPH_RANKM>0?GRAPH_RANKM:0) + 2);
@@ -2530,14 +2543,15 @@ int main(int argc, char** argv) {
         printf("[rknn] rank-M query: metric=%s Kq=%zu slack=%.6g factor=%.6g R2(k)%s=%.6g (radj=off recheck=%d)\n",
                metric.c_str(), Kq, rankm_slack, slack_factor, is_ip?"_base(+qn2s)":"", R2_rankm, RECHECK);
     }
-    std::vector<float> exact_recheck_radii;
+    std::vector<float> source_recheck_thresholds;
     if (RECHECK && anyk_rankm_verification) {
-        exact_recheck_radii.resize((size_t)n * NK);
-        load_exact_radii_table(PFX, n, NK, is_ip, exact_recheck_radii);
-        printf("[rknn] exact recheck is independent of rank-M+RQ; loaded exact radius table\n");
+        source_recheck_thresholds.resize((size_t)n * NK);
+        load_threshold_table(PFX, n, NK, is_ip, source_recheck_thresholds);
+        printf("[rknn] full-precision source recheck is independent of rank-M+RQ\n");
     }
-    const std::vector<float>& recheck_radii = exact_recheck_radii.empty() ? rk2a_all : exact_recheck_radii;
-    // recheck key（原始 d 维）：L2 → d²；IP → −⟨q,o⟩。membership 统一: key ≤ rk2[o]。
+    const std::vector<float>& recheck_radii = source_recheck_thresholds.empty()
+        ? rk2a_all : source_recheck_thresholds;
+    // Original-space predicate key: squared L2 distance or negative inner product.
     auto recheck_key = [&](size_t id, float* q){
         float ip = DistCal::InnerProductSIMD16ExtAVX512_(item(id), q, (uint32_t)d);
         if (is_ip) return -ip;
@@ -2754,7 +2768,7 @@ int main(int argc, char** argv) {
                     else for(uint32_t id:cand) pred.insert(id);
                 }
                 else if (anyk_rankm_verification && !RECHECK) {
-                    for (uint32_t id : cand) pred.insert(id);  // rank-M+RQ predicate already folded into Any-K Lift threshold.
+                    for (uint32_t id : cand) pred.insert(id);  // predicate already folded into the shared Lift threshold.
                 } else {
                     const double threshold_scale = anyk_rankm_verification ? slack_factor : 1.0;
                     for (uint32_t id : cand)

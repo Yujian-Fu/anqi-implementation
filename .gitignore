@@ -1,4 +1,5 @@
 bin/dataset_gt
+bin/build_aknn_source
 bin/rknn_query
 sample/run/
 sample/data/

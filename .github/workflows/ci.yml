@@ -25,6 +25,7 @@ jobs:
         run: make -j2
       - name: Check command-line validation
         run: |
+          bin/build_aknn_source >/dev/null 2>&1 || test "$?" -eq 2
           bin/rknn_query >/dev/null 2>&1 || test "$?" -eq 2
           bin/dataset_gt >/dev/null 2>&1 || test "$?" -eq 2
       - name: Run end-to-end sample when AVX-512 is available
